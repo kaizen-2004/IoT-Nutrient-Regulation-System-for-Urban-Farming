@@ -29,7 +29,8 @@ This project now runs fully on **ESP32-C3** (no PC/Go runtime required).
 
 - `GPIO6`: water valve relay input
 - `GPIO7`: nutrient valve relay input
-- `GPIO3`: tank level sensor input
+- `GPIO2`: HC-SR04 `TRIG` (tank level)
+- `GPIO3`: HC-SR04 `ECHO` (tank level)
 - `GPIO4`: DHT22 zone 1
 - `GPIO5`: DHT22 zone 2
 - `GPIO0`: moisture ADC zone 1
@@ -50,7 +51,8 @@ Use this as the reference wiring table for the full thesis prototype.
 |---|---:|---|---|---|
 | ESP32-C3 Dev Board | 1 | `GPIO6` | Relay CH1 IN (Water) | Water control output |
 | ESP32-C3 Dev Board | 1 | `GPIO7` | Relay CH2 IN (Nutrient) | Nutrient control output |
-| ESP32-C3 Dev Board | 1 | `GPIO3` | Tank float switch signal | Firmware uses `INPUT_PULLUP` |
+| ESP32-C3 Dev Board | 1 | `GPIO2` | HC-SR04 `TRIG` | Tank level pulse trigger output |
+| ESP32-C3 Dev Board | 1 | `GPIO3` | HC-SR04 `ECHO` | Tank level pulse input |
 | ESP32-C3 Dev Board | 1 | `GPIO4` | DHT22 Zone 1 data | Add `10k` pull-up to sensor VCC |
 | ESP32-C3 Dev Board | 1 | `GPIO5` | DHT22 Zone 2 data | Add `10k` pull-up to sensor VCC |
 | ESP32-C3 Dev Board | 1 | `GPIO0` | Moisture sensor Z1 analog out | ADC input |
@@ -72,7 +74,7 @@ Use this as the reference wiring table for the full thesis prototype.
 | 2-Channel Relay Module | 1 | `IN1`, `IN2`, `VCC`, `GND` | `GPIO6`, `GPIO7`, relay rail, GND | Confirm active-high/active-low behavior |
 | Water Solenoid Valve | 1 | +/− coil | 12V supply via Relay CH1 contacts | Add flyback diode if valve has no internal protection |
 | Nutrient Solenoid Valve | 1 | +/− coil | 12V supply via Relay CH2 contacts | Add flyback diode if valve has no internal protection |
-| Tank Float Switch | 1 | Signal, GND | `GPIO3`, GND | Active-low by default in firmware |
+| HC-SR04 (3.3V) | 1 | `VCC`, `GND`, `TRIG`, `ECHO` | 3.3V, GND, `GPIO2`, `GPIO3` | Mount above tank; keep sensor head dry |
 | 20x4 LCD + I2C Backpack | 1 | `VCC`, `GND`, `SDA`, `SCL` | LCD rail, GND, I2C pins | If backpack pull-ups are 5V, use I2C level shifter |
 | Solar Charge Controller | 1 | PV/BAT/LOAD terminals | Solar panel, battery, load rails | Follow controller polarity exactly |
 | 12V Battery | 1 | +/− | Charge controller BAT terminals | Main energy storage |
@@ -104,8 +106,8 @@ Use staged bring-up:
    - Read both sensors and verify stable values.
 5. Moisture sensors:
    - Read raw ADC and validate dry/wet response.
-6. Tank float switch:
-   - Verify high/low transitions on serial logs.
+6. HC-SR04 tank sensor:
+   - Verify stable distance readings and tune low-distance threshold in firmware.
 7. Relay + valves:
    - Test relay channels with valves (or safe dummy load) and flyback protection.
 8. RS485 + NPK sensor #1:

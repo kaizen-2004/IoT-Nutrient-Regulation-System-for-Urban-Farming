@@ -89,9 +89,16 @@ const float HUMIDITY_HIGH_WATER_REDUCTION_FACTOR = 0.70f;
 // Relay configuration (set to false if your relay board is active-low)
 const bool VALVE_ACTIVE_HIGH = true;
 
-// Water tank level input configuration
-const uint8_t TANK_LEVEL_PIN = 3;
-const bool TANK_LEVEL_ACTIVE_LOW = true;
+// HC-SR04 (3.3V variant) tank level configuration.
+// Mount sensor at the tank top pointing downward. Larger distance means lower water level.
+const uint8_t TANK_LEVEL_TRIG_PIN = 2;
+const uint8_t TANK_LEVEL_ECHO_PIN = 3;
+const uint8_t TANK_LEVEL_SAMPLE_COUNT = 5;
+const uint32_t TANK_ULTRASONIC_TIMEOUT_US = 30000UL;
+const float TANK_LOW_DISTANCE_CM = 24.0f; // Tune for your tank geometry.
+const float TANK_MIN_VALID_DISTANCE_CM = 2.0f;
+const float TANK_MAX_VALID_DISTANCE_CM = 300.0f;
+const bool TANK_FAILSAFE_LOW_ON_SENSOR_ERROR = true;
 
 // Pin map for ESP32-C3 (adjust for your exact board wiring)
 const uint8_t WATER_VALVE_PIN = 6;
@@ -159,6 +166,7 @@ uint32_t cycleCount = 0;
 ZoneReadings latestReadings[NUM_ZONES];
 bool hasLatestReadings[NUM_ZONES] = {false, false};
 bool latestTankLow = false;
+float latestTankDistanceCm = NAN;
 uint32_t lastLCDUpdateAt = 0;
 
 uint32_t lastWaterPulseMs = 0;
@@ -2657,23 +2665,54 @@ void runValveFor(uint8_t pin, uint32_t durationMs, const char *valveName)
   setValve(pin, false);
 }
 
-bool isTankLevelLow()
+float readTankDistanceCm()
 {
-  uint8_t lowVotes = 0;
-  const uint8_t sampleCount = 12;
+  digitalWrite(TANK_LEVEL_TRIG_PIN, LOW);
+  delayMicroseconds(3);
+  digitalWrite(TANK_LEVEL_TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TANK_LEVEL_TRIG_PIN, LOW);
 
-  for (uint8_t i = 0; i < sampleCount; i++)
+  unsigned long pulseWidthUs = pulseIn(TANK_LEVEL_ECHO_PIN, HIGH, TANK_ULTRASONIC_TIMEOUT_US);
+  if (pulseWidthUs == 0)
   {
-    int raw = digitalRead(TANK_LEVEL_PIN);
-    bool low = TANK_LEVEL_ACTIVE_LOW ? (raw == LOW) : (raw == HIGH);
-    if (low)
-    {
-      lowVotes++;
-    }
-    delay(2);
+    return NAN;
   }
 
-  return lowVotes > (sampleCount / 2);
+  return ((float)pulseWidthUs * 0.0343f) * 0.5f;
+}
+
+bool isTankLevelLow()
+{
+  uint8_t validSamples = 0;
+  uint8_t lowVotes = 0;
+  float distanceSum = 0.0f;
+
+  for (uint8_t i = 0; i < TANK_LEVEL_SAMPLE_COUNT; i++)
+  {
+    float distanceCm = readTankDistanceCm();
+    if (!isnan(distanceCm) &&
+        distanceCm >= TANK_MIN_VALID_DISTANCE_CM &&
+        distanceCm <= TANK_MAX_VALID_DISTANCE_CM)
+    {
+      validSamples++;
+      distanceSum += distanceCm;
+      if (distanceCm >= TANK_LOW_DISTANCE_CM)
+      {
+        lowVotes++;
+      }
+    }
+    delay(25);
+  }
+
+  if (validSamples == 0)
+  {
+    latestTankDistanceCm = NAN;
+    return TANK_FAILSAFE_LOW_ON_SENSOR_ERROR ? true : latestTankLow;
+  }
+
+  latestTankDistanceCm = distanceSum / (float)validSamples;
+  return lowVotes > (validSamples / 2);
 }
 
 float moisturePercentFromRaw(int raw, int dryRaw, int wetRaw)
@@ -3102,6 +3141,16 @@ String buildStatusJSON()
   json += "\"tankLow\":";
   json += (latestTankLow ? "true" : "false");
   json += ",";
+  json += "\"tankDistanceCm\":";
+  if (isnan(latestTankDistanceCm))
+  {
+    json += "null";
+  }
+  else
+  {
+    json += String(latestTankDistanceCm, 2);
+  }
+  json += ",";
   json += "\"lastWaterPulseMs\":";
   json += String(lastWaterPulseMs);
   json += ",";
@@ -3251,6 +3300,20 @@ String buildInfoJSON()
   json += ",\"criticalHighGt\":";
   json += String(NUTRIENT_CRITICAL_HIGH_PPM, 1);
   json += "}";
+  json += "},";
+  json += "\"tankSensor\":{";
+  json += "\"type\":\"hc-sr04-3v3\",";
+  json += "\"trigPin\":";
+  json += String(TANK_LEVEL_TRIG_PIN);
+  json += ",";
+  json += "\"echoPin\":";
+  json += String(TANK_LEVEL_ECHO_PIN);
+  json += ",";
+  json += "\"lowDistanceCm\":";
+  json += String(TANK_LOW_DISTANCE_CM, 1);
+  json += ",";
+  json += "\"timeoutUs\":";
+  json += String(TANK_ULTRASONIC_TIMEOUT_US);
   json += "},";
   json += "\"localApiEnabled\":";
   json += (ENABLE_LOCAL_API_SERVER ? "true" : "false");
@@ -3633,7 +3696,16 @@ void executeControlCycle()
   bool tankLow = isTankLevelLow();
   latestTankLow = tankLow;
 
-  Serial.printf("{\"type\":\"tank\",\"low\":%s}\n", tankLow ? "true" : "false");
+  if (isnan(latestTankDistanceCm))
+  {
+    Serial.printf("{\"type\":\"tank\",\"sensor\":\"hc-sr04-3v3\",\"distanceCm\":null,\"low\":%s}\n",
+                  tankLow ? "true" : "false");
+  }
+  else
+  {
+    Serial.printf("{\"type\":\"tank\",\"sensor\":\"hc-sr04-3v3\",\"distanceCm\":%.2f,\"low\":%s}\n",
+                  latestTankDistanceCm, tankLow ? "true" : "false");
+  }
 
   if (tankLow && !previousTankLow)
   {
@@ -3744,7 +3816,9 @@ void setup()
 
   pinMode(WATER_VALVE_PIN, OUTPUT);
   pinMode(NUTRIENT_VALVE_PIN, OUTPUT);
-  pinMode(TANK_LEVEL_PIN, INPUT_PULLUP);
+  pinMode(TANK_LEVEL_TRIG_PIN, OUTPUT);
+  pinMode(TANK_LEVEL_ECHO_PIN, INPUT);
+  digitalWrite(TANK_LEVEL_TRIG_PIN, LOW);
 
   closeAllValves();
 
