@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <DHT.h>
+#include <HardwareSerial.h>
 #include <LiquidCrystal_I2C.h>
 #include <WebServer.h>
 #include <WiFi.h>
@@ -42,6 +43,7 @@ void emitReadings(uint8_t zoneIndex, const ZoneReadings &r);
 void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info);
 void scanAndLogTargetSSID();
 void setupMDNSService();
+void ensureMDNSService();
 void stopMDNSService();
 
 const uint8_t NUM_ZONES = 2;
@@ -108,6 +110,10 @@ const uint8_t MOISTURE_PINS[NUM_ZONES] = {0, 1};
 const uint8_t RS485_TX_PIN = 21;
 const uint8_t RS485_RX_PIN = 20;
 const uint8_t RS485_DE_RE_PIN = 10;
+const bool RS485_DE_RE_TX_HIGH = true;
+const uint32_t RS485_BAUD = 9600;
+const uint8_t NPK_SENSOR_ADDRS[NUM_ZONES] = {1, 2};
+const uint32_t RS485_RESPONSE_TIMEOUT_MS = 500;
 
 // Moisture calibration per zone (ADC raw values, 12-bit: 0..4095)
 const int MOISTURE_DRY_RAW[NUM_ZONES] = {3000, 3000};
@@ -126,6 +132,7 @@ const char *WIFI_SSID = "CondoIoT";
 const char *WIFI_PASSWORD = "condo2026";
 const uint32_t WIFI_CONNECT_TIMEOUT_MS = 20000UL;
 const uint32_t WIFI_RETRY_INTERVAL_MS = 15000UL;
+const uint32_t MDNS_RETRY_INTERVAL_MS = 5000UL;
 const wifi_power_t WIFI_TX_POWER_LEVEL = WIFI_POWER_8_5dBm;
 const bool ENABLE_MDNS = true;
 const char *MDNS_HOSTNAME = "plantcare";
@@ -147,6 +154,7 @@ WebServer webServer(80);
 DHT dhtZone1(DHT_PINS[0], DHT22);
 DHT dhtZone2(DHT_PINS[1], DHT22);
 DHT *dhtSensors[NUM_ZONES] = {&dhtZone1, &dhtZone2};
+HardwareSerial RS485Serial(1);
 
 ZoneThresholds thresholds[NUM_ZONES] = {
     {55.0f, 20.0f, 30.0f, 20.0f, 25.0f},
@@ -185,6 +193,7 @@ bool hasPreferredWiFiBssid = false;
 uint8_t preferredWiFiBssid[6] = {0, 0, 0, 0, 0, 0};
 int32_t preferredWiFiChannel = 0;
 bool mdnsStarted = false;
+uint32_t lastMDNSRetryAt = 0;
 uint32_t lastEmailSentAt = 0;
 bool lastCycleCriticalNutrientLockout = false;
 bool lastWiFiConnected = false;
@@ -2172,6 +2181,7 @@ void serviceNetwork()
   {
     webServer.handleClient();
   }
+  ensureMDNSService();
 }
 
 void delayWithService(uint32_t delayMs)
@@ -2331,7 +2341,25 @@ void setupMDNSService()
   MDNS.addService("http", "tcp", 80);
   MDNS.addServiceTxt("http", "tcp", "path", "/");
   mdnsStarted = true;
+  lastMDNSRetryAt = millis();
   Serial.printf("mDNS: http://%s.local/\n", MDNS_HOSTNAME);
+}
+
+void ensureMDNSService()
+{
+  if (!ENABLE_MDNS || mdnsStarted || WiFi.status() != WL_CONNECTED)
+  {
+    return;
+  }
+
+  uint32_t now = millis();
+  if ((uint32_t)(now - lastMDNSRetryAt) < MDNS_RETRY_INTERVAL_MS)
+  {
+    return;
+  }
+
+  lastMDNSRetryAt = now;
+  setupMDNSService();
 }
 
 void stopMDNSService()
@@ -2756,13 +2784,123 @@ float readSoilMoisturePercent(uint8_t zoneIndex)
   return moisturePercentFromRaw(avgRaw, MOISTURE_DRY_RAW[zoneIndex], MOISTURE_WET_RAW[zoneIndex]);
 }
 
-NPK readNPK(uint8_t zoneIndex)
+uint16_t modbusCRC16(const uint8_t *data, uint16_t len)
 {
-  // Replace this stub with your NPK sensor integration (typically RS485/Modbus).
-  NPK npk;
-  npk.n = 25.0f + zoneIndex;
-  npk.p = 18.0f + zoneIndex;
-  npk.k = 22.0f + zoneIndex;
+  uint16_t crc = 0xFFFF;
+  for (uint16_t pos = 0; pos < len; pos++)
+  {
+    crc ^= (uint16_t)data[pos];
+    for (uint8_t i = 0; i < 8; i++)
+    {
+      if (crc & 0x0001)
+      {
+        crc >>= 1;
+        crc ^= 0xA001;
+      }
+      else
+      {
+        crc >>= 1;
+      }
+    }
+  }
+  return crc;
+}
+
+void setRS485DirectionTx(bool txEnable)
+{
+  bool level = txEnable ? RS485_DE_RE_TX_HIGH : !RS485_DE_RE_TX_HIGH;
+  digitalWrite(RS485_DE_RE_PIN, level ? HIGH : LOW);
+}
+
+void flushRS485Input()
+{
+  while (RS485Serial.available())
+  {
+    RS485Serial.read();
+  }
+}
+
+bool readNPKRegisters(uint8_t addr, float &n, float &p, float &k)
+{
+  uint8_t req[8];
+  req[0] = addr;
+  req[1] = 0x03;
+  req[2] = 0x00;
+  req[3] = 0x1E;
+  req[4] = 0x00;
+  req[5] = 0x03;
+  uint16_t crc = modbusCRC16(req, 6);
+  req[6] = (uint8_t)(crc & 0xFF);
+  req[7] = (uint8_t)((crc >> 8) & 0xFF);
+
+  flushRS485Input();
+  setRS485DirectionTx(true);
+  delay(2);
+  RS485Serial.write(req, sizeof(req));
+  RS485Serial.flush();
+  delay(2);
+  setRS485DirectionTx(false);
+
+  uint8_t resp[32];
+  uint8_t len = 0;
+  uint32_t startedAt = millis();
+  while ((uint32_t)(millis() - startedAt) < RS485_RESPONSE_TIMEOUT_MS)
+  {
+    while (RS485Serial.available() && len < sizeof(resp))
+    {
+      resp[len++] = (uint8_t)RS485Serial.read();
+    }
+    if (len >= 11)
+    {
+      break;
+    }
+    delay(1);
+  }
+
+  if (len < 11 || resp[0] != addr || resp[1] != 0x03 || resp[2] != 0x06)
+  {
+    return false;
+  }
+
+  uint16_t crcRx = (uint16_t)resp[9] | ((uint16_t)resp[10] << 8);
+  uint16_t crcCalc = modbusCRC16(resp, 9);
+  if (crcRx != crcCalc)
+  {
+    return false;
+  }
+
+  n = (float)(((uint16_t)resp[3] << 8) | resp[4]);
+  p = (float)(((uint16_t)resp[5] << 8) | resp[6]);
+  k = (float)(((uint16_t)resp[7] << 8) | resp[8]);
+  return true;
+}
+
+NPK readNPK(uint8_t zoneNumber)
+{
+  NPK npk = {0.0f, 0.0f, 0.0f};
+  if (zoneNumber == 0 || zoneNumber > NUM_ZONES)
+  {
+    return npk;
+  }
+
+  uint8_t zoneIndex = zoneNumber - 1;
+  uint8_t sensorAddr = NPK_SENSOR_ADDRS[zoneIndex];
+  if (readNPKRegisters(sensorAddr, npk.n, npk.p, npk.k))
+  {
+    return npk;
+  }
+
+  if (hasLatestReadings[zoneIndex])
+  {
+    return latestReadings[zoneIndex].npk;
+  }
+
+  npk.n = thresholds[zoneIndex].nMin;
+  npk.p = thresholds[zoneIndex].pMin;
+  npk.k = thresholds[zoneIndex].kMin;
+  Serial.printf("{\"type\":\"warning\",\"zone\":%u,\"npkRead\":\"failed\",\"sensorAddr\":%u}\n",
+                zoneNumber,
+                sensorAddr);
   return npk;
 }
 
@@ -3824,6 +3962,10 @@ void setup()
 
   dhtZone1.begin();
   dhtZone2.begin();
+
+  pinMode(RS485_DE_RE_PIN, OUTPUT);
+  setRS485DirectionTx(false);
+  RS485Serial.begin(RS485_BAUD, SERIAL_8N1, RS485_RX_PIN, RS485_TX_PIN);
 
   for (uint8_t zone = 0; zone < NUM_ZONES; zone++)
   {

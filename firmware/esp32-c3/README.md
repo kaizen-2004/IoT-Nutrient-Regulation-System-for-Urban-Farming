@@ -6,7 +6,7 @@ This project now runs fully on **ESP32-C3** (no PC/Go runtime required).
 
 - 2x capacitive soil moisture sensors
 - 2x DHT22 sensors
-- 2x NPK sensors (stub in code; replace with RS485/Modbus implementation)
+- 2x NPK sensors via RS485/Modbus (shared bus, unique addresses)
 - 1x tank level sensor for low-water safety
 - 2x relay outputs for water/nutrient solenoid valves
 - 20x4 LCD (I2C) for real-time local monitoring

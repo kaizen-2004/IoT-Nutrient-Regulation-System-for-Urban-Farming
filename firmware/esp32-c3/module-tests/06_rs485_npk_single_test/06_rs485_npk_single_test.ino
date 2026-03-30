@@ -1,16 +1,20 @@
 #include <Arduino.h>
 #include <HardwareSerial.h>
 
-const uint32_t SERIAL_BAUD = 115200;
+const uint32_t SERIAL_BAUD = 4800;
 const uint32_t RS485_BAUD = 9600;
 const uint8_t RS485_TX_PIN = 21;
 const uint8_t RS485_RX_PIN = 20;
 const uint8_t RS485_DE_RE_PIN = 10;
-const bool RS485_DE_RE_TX_HIGH = true;
+const bool RS485_DE_RE_TX_HIGH = false;
 
-const uint8_t SENSOR_ADDR = 1; // Set to your current single-sensor Modbus address.
+const uint8_t SENSOR_ADDR = 1; // Used when address scan is disabled.
 const uint32_t POLL_MS = 2000;
-const uint32_t RESPONSE_TIMEOUT_MS = 500;
+const uint32_t SINGLE_RESPONSE_TIMEOUT_MS = 500;
+const uint32_t SCAN_RESPONSE_TIMEOUT_MS = 120;
+const bool ENABLE_ADDRESS_SCAN = true;
+const uint8_t SCAN_ADDR_START = 1;
+const uint8_t SCAN_ADDR_END = 40;
 
 HardwareSerial RS485Serial(1);
 
@@ -53,7 +57,7 @@ void flushRS485Input()
   }
 }
 
-bool readNPKRegisters(uint8_t addr, uint16_t &n, uint16_t &p, uint16_t &k)
+bool readNPKRegisters(uint8_t addr, uint16_t &n, uint16_t &p, uint16_t &k, uint32_t timeoutMs)
 {
   // Common JXCT/SN-3002 register block:
   // Function 0x03, start 0x001E, quantity 0x0003 => N, P, K
@@ -80,7 +84,7 @@ bool readNPKRegisters(uint8_t addr, uint16_t &n, uint16_t &p, uint16_t &k)
   uint8_t len = 0;
   uint32_t startedAt = millis();
 
-  while ((uint32_t)(millis() - startedAt) < RESPONSE_TIMEOUT_MS)
+  while ((uint32_t)(millis() - startedAt) < timeoutMs)
   {
     while (RS485Serial.available() && len < sizeof(resp))
     {
@@ -144,13 +148,25 @@ void setup()
   Serial.println();
   Serial.println("=== NILA Module Test 06: RS485 NPK Single Sensor ===");
   Serial.printf("RS485 TX=%u RX=%u DE/RE=%u\n", RS485_TX_PIN, RS485_RX_PIN, RS485_DE_RE_PIN);
-  Serial.printf("Sensor address=%u, baud=%lu\n", SENSOR_ADDR, (unsigned long)RS485_BAUD);
+  if (ENABLE_ADDRESS_SCAN)
+  {
+    Serial.printf("Address scan enabled: %u..%u, baud=%lu\n",
+                  SCAN_ADDR_START,
+                  SCAN_ADDR_END,
+                  (unsigned long)RS485_BAUD);
+  }
+  else
+  {
+    Serial.printf("Sensor address=%u, baud=%lu\n", SENSOR_ADDR, (unsigned long)RS485_BAUD);
+  }
   Serial.println("Polling register block: 0x001E..0x0020 (N,P,K).");
 
   pinMode(RS485_DE_RE_PIN, OUTPUT);
   setRS485DirectionTx(false);
+  pinMode(RS485_RX_PIN, INPUT_PULLUP);
 
-  RS485Serial.begin(RS485_BAUD, SERIAL_8N1, RS485_RX_PIN, RS485_TX_PIN);
+  RS485Serial.begin(RS485_BAUD, SERIAL_8E1, RS485_RX_PIN,
+  RS485_TX_PIN);
 }
 
 void loop()
@@ -165,10 +181,43 @@ void loop()
   lastPollAt = now;
   pollCount++;
 
+  if (ENABLE_ADDRESS_SCAN)
+  {
+    Serial.printf("[scan %lu] probing addresses %u..%u\n",
+                  (unsigned long)pollCount,
+                  SCAN_ADDR_START,
+                  SCAN_ADDR_END);
+    bool foundAny = false;
+    for (uint8_t addr = SCAN_ADDR_START; addr <= SCAN_ADDR_END; addr++)
+    {
+      uint16_t n = 0;
+      uint16_t p = 0;
+      uint16_t k = 0;
+      bool ok = readNPKRegisters(addr, n, p, k, SCAN_RESPONSE_TIMEOUT_MS);
+      if (ok)
+      {
+        foundAny = true;
+        Serial.printf("[scan %lu] addr=%u N=%u P=%u K=%u\n",
+                      (unsigned long)pollCount,
+                      addr,
+                      n,
+                      p,
+                      k);
+      }
+      delay(25);
+    }
+
+    if (!foundAny)
+    {
+      Serial.printf("[scan %lu] no sensor found in range.\n", (unsigned long)pollCount);
+    }
+    return;
+  }
+
   uint16_t n = 0;
   uint16_t p = 0;
   uint16_t k = 0;
-  bool ok = readNPKRegisters(SENSOR_ADDR, n, p, k);
+  bool ok = readNPKRegisters(SENSOR_ADDR, n, p, k, SINGLE_RESPONSE_TIMEOUT_MS);
 
   if (ok)
   {

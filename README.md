@@ -9,7 +9,7 @@ This repository now contains:
 
 - Soil monitoring:
   - 2x capacitive soil moisture sensors
-  - 2x NPK soil sensors (integration stub provided)
+  - 2x NPK soil sensors via RS485/Modbus (addresses 1 and 2 by default)
 - Ambient monitoring:
   - 2x DHT22 sensors (temperature/humidity)
 - Tank safety:
@@ -37,6 +37,7 @@ This repository now contains:
 - `firmware/esp32-c3/README.md`: firmware setup, pins, and feature guide
 - `apps/mobile-dashboard/`: Capacitor-based local dashboard app
 - `PARTS_LIST.md`: specific components and parts list
+- `HARDWARE_BRINGUP_STATUS.md`: running checklist of module validation progress
 - `AGENT.md`: thesis/project description source
 
 ## Getting Started
@@ -64,7 +65,7 @@ Detailed local fixed-address instructions are in `firmware/esp32-c3/README.md`, 
 
 ## Notes
 
-- `readNPK()` is currently a stub; replace it with your RS485/Modbus sensor code.
+- NPK reads use RS485/Modbus (`GPIO21` TX, `GPIO20` RX, `GPIO10` DE/RE by default).
 - If your relay board is active-low, set `VALVE_ACTIVE_HIGH=false` in firmware.
 - Tank sensor defaults to active-low (`TANK_LEVEL_ACTIVE_LOW=true`).
 - Email alerts are off by default (`ENABLE_EMAIL_ALERTS=false`) until SMTP settings are configured.

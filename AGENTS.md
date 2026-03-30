@@ -67,7 +67,6 @@ Implemented features in firmware:
 
 ## 7) Known Gaps / Next Technical Improvements
 
-- `readNPK()` currently uses placeholder values and should be replaced with real RS485/Modbus implementation.
 - Production hardening areas:
   - sensor calibration persistence
   - fault tolerance for disconnected sensors
