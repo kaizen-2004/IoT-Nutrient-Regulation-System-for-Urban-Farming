@@ -2,10 +2,14 @@
 #include <DHT.h>
 #include <HardwareSerial.h>
 #include <LiquidCrystal_I2C.h>
+#include <Preferences.h>
+#define ENABLE_LOCAL_API_SERVER 0
 #include <WebServer.h>
+#if ENABLE_LOCAL_API_SERVER
+#include <ESPmDNS.h>
+#endif
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
-#include <ESPmDNS.h>
 #include <Wire.h>
 
 // ESP32-C3 firmware for thesis project:
@@ -42,9 +46,31 @@ void maintainWiFiConnection();
 void emitReadings(uint8_t zoneIndex, const ZoneReadings &r);
 void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info);
 void scanAndLogTargetSSID();
+void setupApiServer();
+void stopApiServer();
+void ensureApiServerState();
+void serviceNetwork();
+void loadWiFiCredentials();
+bool saveWiFiCredentials(const String &ssid, const String &password);
+void clearWiFiCredentials();
+void startProvisioningMode(const char *reason);
+void stopProvisioningMode();
+String buildStatusJSON();
+String buildInfoJSON();
+String buildProvisioningInfoJSON();
+String buildProvisioningResultJSON();
+String buildHealthJSON();
+String buildQrPayloadJSON();
+String jsonEscape(const String &input);
+bool extractJsonStringField(const String &json, const char *fieldName, String &outValue);
+String currentNetworkIp();
+String deviceId();
+String provisioningApSsid();
+#if ENABLE_LOCAL_API_SERVER
 void setupMDNSService();
 void ensureMDNSService();
 void stopMDNSService();
+#endif
 
 const uint8_t NUM_ZONES = 2;
 const char *DEVICE_NAME = "Vertical Farm Controller";
@@ -123,19 +149,28 @@ const int MOISTURE_WET_RAW[NUM_ZONES] = {1300, 1300};
 const uint8_t LCD_I2C_ADDRESS = 0x27;
 const uint8_t LCD_COLS = 20;
 const uint8_t LCD_ROWS = 4;
-const uint32_t LCD_PAGE_INTERVAL_MS = 1000UL;
+const uint32_t LCD_REFRESH_INTERVAL_MS = 1000UL;
+const uint32_t LCD_PAGE_ROTATE_INTERVAL_MS = 5000UL;
 const uint32_t TELEMETRY_REFRESH_INTERVAL_MS = 3000UL;
 
-// Wi-Fi and local API configuration
-const bool ENABLE_LOCAL_API_SERVER = true;
-const char *WIFI_SSID = "CondoIoT";
-const char *WIFI_PASSWORD = "condo2026";
+// Wi-Fi configuration
+// The Flutter app uses the JSON API for both provisioning and monitoring.
+const char *WIFI_SSID = "";
+const char *WIFI_PASSWORD = "";
 const uint32_t WIFI_CONNECT_TIMEOUT_MS = 20000UL;
 const uint32_t WIFI_RETRY_INTERVAL_MS = 15000UL;
+const uint32_t WIFI_PROVISIONING_FALLBACK_MS = 5UL * 60UL * 1000UL;
 const uint32_t MDNS_RETRY_INTERVAL_MS = 5000UL;
 const wifi_power_t WIFI_TX_POWER_LEVEL = WIFI_POWER_8_5dBm;
 const bool ENABLE_MDNS = true;
 const char *MDNS_HOSTNAME = "plantcare";
+const char *WIFI_PREFS_NAMESPACE = "wifi";
+const char *WIFI_PREFS_SSID_KEY = "ssid";
+const char *WIFI_PREFS_PASSWORD_KEY = "password";
+const char *PROVISIONING_AP_PREFIX = "NutrientReg-Setup";
+const uint8_t PROVISIONING_MAX_SSID_LEN = 32;
+const uint8_t PROVISIONING_MAX_PASSWORD_LEN = 64;
+const uint32_t PROVISIONING_SUCCESS_HOLD_MS = 30000UL;
 
 // Email alert configuration
 const bool ENABLE_EMAIL_ALERTS = false;
@@ -149,7 +184,11 @@ const uint32_t EMAIL_ALERT_COOLDOWN_MS = 30UL * 60UL * 1000UL;
 const bool SMTP_ALLOW_INSECURE_TLS = true;
 
 LiquidCrystal_I2C lcd(LCD_I2C_ADDRESS, LCD_COLS, LCD_ROWS);
+WebServer apiServer(80);
+Preferences wifiPrefs;
+#if ENABLE_LOCAL_API_SERVER
 WebServer webServer(80);
+#endif
 
 DHT dhtZone1(DHT_PINS[0], DHT22);
 DHT dhtZone2(DHT_PINS[1], DHT22);
@@ -176,6 +215,10 @@ bool hasLatestReadings[NUM_ZONES] = {false, false};
 bool latestTankLow = false;
 float latestTankDistanceCm = NAN;
 uint32_t lastLCDUpdateAt = 0;
+uint32_t lastLCDPageSwitchAt = 0;
+uint8_t currentLCDPage = 0;
+bool lcdNeedsFullRefresh = true;
+char lastLCDLines[LCD_ROWS][LCD_COLS + 1] = {{0}};
 
 uint32_t lastWaterPulseMs = 0;
 uint32_t lastNutrientPulseMs = 0;
@@ -186,14 +229,29 @@ bool waterValveOpen = false;
 bool nutrientValveOpen = false;
 
 String lastAlertMessage = "none";
+bool apiServerStarted = false;
+bool apiRoutesRegistered = false;
+bool provisioningMode = false;
+bool provisioningConnectRequested = false;
+uint32_t wifiConnectWindowStartedAt = 0;
+uint32_t provisioningSuccessAt = 0;
+uint32_t provisioningConnectEarliestAt = 0;
+String provisioningState = "idle";
+String provisioningFailureReason = "none";
+char configuredWiFiSsid[PROVISIONING_MAX_SSID_LEN + 1] = {0};
+char configuredWiFiPassword[PROVISIONING_MAX_PASSWORD_LEN + 1] = {0};
+#if ENABLE_LOCAL_API_SERVER
 bool serverStarted = false;
+#endif
 uint32_t lastWiFiReconnectAttemptAt = 0;
 uint32_t lastWiFiBeginAt = 0;
 bool hasPreferredWiFiBssid = false;
 uint8_t preferredWiFiBssid[6] = {0, 0, 0, 0, 0, 0};
 int32_t preferredWiFiChannel = 0;
+#if ENABLE_LOCAL_API_SERVER
 bool mdnsStarted = false;
 uint32_t lastMDNSRetryAt = 0;
+#endif
 uint32_t lastEmailSentAt = 0;
 bool lastCycleCriticalNutrientLockout = false;
 bool lastWiFiConnected = false;
@@ -203,7 +261,7 @@ bool prevNutrientLowState[NUM_ZONES] = {false, false};
 bool prevNutrientHighState[NUM_ZONES] = {false, false};
 bool prevNutrientCriticalState[NUM_ZONES] = {false, false};
 
-#if 1
+#if ENABLE_LOCAL_API_SERVER
 const char DASHBOARD_HTML[] PROGMEM = R"HTML(
 <!doctype html>
 <html lang="en">
@@ -2159,9 +2217,162 @@ bool isConfiguredValue(const char *value)
   return strncmp(value, "YOUR_", 5) != 0;
 }
 
+void loadWiFiCredentials()
+{
+  configuredWiFiSsid[0] = '\0';
+  configuredWiFiPassword[0] = '\0';
+
+  if (wifiPrefs.begin(WIFI_PREFS_NAMESPACE, true))
+  {
+    String savedSsid = wifiPrefs.getString(WIFI_PREFS_SSID_KEY, "");
+    String savedPassword = wifiPrefs.getString(WIFI_PREFS_PASSWORD_KEY, "");
+    wifiPrefs.end();
+
+    if (savedSsid.length() > 0 && savedSsid.length() <= PROVISIONING_MAX_SSID_LEN && savedPassword.length() <= PROVISIONING_MAX_PASSWORD_LEN)
+    {
+      savedSsid.toCharArray(configuredWiFiSsid, sizeof(configuredWiFiSsid));
+      savedPassword.toCharArray(configuredWiFiPassword, sizeof(configuredWiFiPassword));
+      return;
+    }
+  }
+
+  if (isConfiguredValue(WIFI_SSID) && strlen(WIFI_SSID) <= PROVISIONING_MAX_SSID_LEN)
+  {
+    strncpy(configuredWiFiSsid, WIFI_SSID, sizeof(configuredWiFiSsid) - 1);
+    configuredWiFiSsid[sizeof(configuredWiFiSsid) - 1] = '\0';
+  }
+  if (strlen(WIFI_PASSWORD) <= PROVISIONING_MAX_PASSWORD_LEN)
+  {
+    strncpy(configuredWiFiPassword, WIFI_PASSWORD, sizeof(configuredWiFiPassword) - 1);
+    configuredWiFiPassword[sizeof(configuredWiFiPassword) - 1] = '\0';
+  }
+}
+
+bool saveWiFiCredentials(const String &ssid, const String &password)
+{
+  if (ssid.length() == 0 || ssid.length() > PROVISIONING_MAX_SSID_LEN || password.length() > PROVISIONING_MAX_PASSWORD_LEN)
+  {
+    return false;
+  }
+
+  if (!wifiPrefs.begin(WIFI_PREFS_NAMESPACE, false))
+  {
+    return false;
+  }
+
+  bool ok = wifiPrefs.putString(WIFI_PREFS_SSID_KEY, ssid) > 0;
+  ok = ok && (wifiPrefs.putString(WIFI_PREFS_PASSWORD_KEY, password) >= 0);
+  wifiPrefs.end();
+
+  if (!ok)
+  {
+    return false;
+  }
+
+  ssid.toCharArray(configuredWiFiSsid, sizeof(configuredWiFiSsid));
+  password.toCharArray(configuredWiFiPassword, sizeof(configuredWiFiPassword));
+  return true;
+}
+
+void clearWiFiCredentials()
+{
+  if (wifiPrefs.begin(WIFI_PREFS_NAMESPACE, false))
+  {
+    wifiPrefs.remove(WIFI_PREFS_SSID_KEY);
+    wifiPrefs.remove(WIFI_PREFS_PASSWORD_KEY);
+    wifiPrefs.end();
+  }
+
+  configuredWiFiSsid[0] = '\0';
+  configuredWiFiPassword[0] = '\0';
+}
+
+String deviceId()
+{
+  static String cached;
+  if (cached.length() > 0)
+  {
+    return cached;
+  }
+
+  uint64_t chipId = ESP.getEfuseMac();
+  char suffix[7];
+  snprintf(suffix, sizeof(suffix), "%06llX", (unsigned long long)(chipId & 0xFFFFFFULL));
+  cached = String("plantcare-") + String(suffix);
+  cached.toLowerCase();
+  return cached;
+}
+
+String provisioningApSsid()
+{
+  static String cached;
+  if (cached.length() == 0)
+  {
+    String id = deviceId();
+    int hyphen = id.lastIndexOf('-');
+    String suffix = hyphen >= 0 ? id.substring(hyphen + 1) : id;
+    cached = String(PROVISIONING_AP_PREFIX) + "-" + suffix;
+  }
+  return cached;
+}
+
+String currentNetworkIp()
+{
+  if (WiFi.status() == WL_CONNECTED)
+  {
+    return WiFi.localIP().toString();
+  }
+  if (provisioningMode)
+  {
+    return WiFi.softAPIP().toString();
+  }
+  return String("0.0.0.0");
+}
+
+void startProvisioningMode(const char *reason)
+{
+  stopApiServer();
+  provisioningMode = true;
+  provisioningConnectRequested = false;
+  provisioningSuccessAt = 0;
+  provisioningConnectEarliestAt = 0;
+  provisioningState = "waiting_for_credentials";
+  provisioningFailureReason = (reason != nullptr && strlen(reason) > 0) ? String(reason) : String("none");
+  wifiConnectWindowStartedAt = 0;
+  lastWiFiBeginAt = 0;
+
+  WiFi.setAutoReconnect(false);
+  WiFi.disconnect(false, false);
+  WiFi.mode(WIFI_AP);
+  delay(100);
+  WiFi.softAP(provisioningApSsid().c_str());
+
+  String alert = String("Setup AP ready: ") + provisioningApSsid();
+  setAlertMessage(alert);
+  Serial.printf("Provisioning mode active. SSID=%s IP=%s\n", provisioningApSsid().c_str(), WiFi.softAPIP().toString().c_str());
+}
+
+void stopProvisioningMode()
+{
+  if (!provisioningMode)
+  {
+    return;
+  }
+
+  stopApiServer();
+  provisioningMode = false;
+  provisioningConnectRequested = false;
+  provisioningSuccessAt = 0;
+  provisioningConnectEarliestAt = 0;
+  provisioningState = "idle";
+  provisioningFailureReason = "none";
+  WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_STA);
+}
+
 bool hasWiFiConfig()
 {
-  return isConfiguredValue(WIFI_SSID) && isConfiguredValue(WIFI_PASSWORD);
+  return isConfiguredValue(configuredWiFiSsid);
 }
 
 bool hasEmailConfig()
@@ -2177,11 +2388,20 @@ void setAlertMessage(const String &message)
 
 void serviceNetwork()
 {
-  if (ENABLE_LOCAL_API_SERVER && serverStarted)
+  ensureApiServerState();
+
+  if (apiServerStarted)
+  {
+    apiServer.handleClient();
+  }
+
+#if ENABLE_LOCAL_API_SERVER
+  if (serverStarted)
   {
     webServer.handleClient();
   }
   ensureMDNSService();
+#endif
 }
 
 void delayWithService(uint32_t delayMs)
@@ -2204,6 +2424,15 @@ void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info)
     break;
   case ARDUINO_EVENT_WIFI_STA_GOT_IP:
     Serial.printf("[WiFiEvent] STA got IP: %s\n", WiFi.localIP().toString().c_str());
+    if (provisioningMode)
+    {
+      provisioningState = "connected";
+      provisioningFailureReason = "none";
+      if (provisioningSuccessAt == 0)
+      {
+        provisioningSuccessAt = millis();
+      }
+    }
     break;
   case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
     Serial.printf("[WiFiEvent] STA disconnected. reason=%d\n", (int)info.wifi_sta_disconnected.reason);
@@ -2216,7 +2445,7 @@ void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info)
 
 void scanAndLogTargetSSID()
 {
-  WiFi.mode(WIFI_STA);
+  WiFi.mode(provisioningMode ? WIFI_AP_STA : WIFI_STA);
   int16_t found = WiFi.scanNetworks(false, true);
   if (found < 0)
   {
@@ -2240,7 +2469,7 @@ void scanAndLogTargetSSID()
     String ssid = WiFi.SSID(i);
     int32_t rssi = WiFi.RSSI(i);
     uint8_t enc = WiFi.encryptionType(i);
-    if (ssid == WIFI_SSID)
+    if (ssid == configuredWiFiSsid)
     {
       targetFound = true;
       int32_t ch = WiFi.channel(i);
@@ -2272,7 +2501,7 @@ void scanAndLogTargetSSID()
     if (hasPreferredWiFiBssid)
     {
       Serial.printf("Target SSID '%s' selected BSSID=%02X:%02X:%02X:%02X:%02X:%02X ch=%d RSSI=%d dBm enc=%u\n",
-                    WIFI_SSID,
+                    configuredWiFiSsid,
                     preferredWiFiBssid[0], preferredWiFiBssid[1], preferredWiFiBssid[2],
                     preferredWiFiBssid[3], preferredWiFiBssid[4], preferredWiFiBssid[5],
                     (int)preferredWiFiChannel, (int)targetRssi, (unsigned)targetEnc);
@@ -2280,12 +2509,12 @@ void scanAndLogTargetSSID()
     else
     {
       Serial.printf("Target SSID '%s' detected. RSSI=%d dBm, enc=%u\n",
-                    WIFI_SSID, (int)targetRssi, (unsigned)targetEnc);
+                    configuredWiFiSsid, (int)targetRssi, (unsigned)targetEnc);
     }
   }
   else
   {
-    Serial.printf("Target SSID '%s' not found in scan.\n", WIFI_SSID);
+    Serial.printf("Target SSID '%s' not found in scan.\n", configuredWiFiSsid);
   }
 
   WiFi.scanDelete();
@@ -2300,11 +2529,11 @@ void beginWiFiConnection(bool resetBeforeBegin = false)
     // so force Wi-Fi off briefly before starting a fresh STA session.
     WiFi.setAutoReconnect(false);
     WiFi.disconnect(false, false);
-    WiFi.mode(WIFI_OFF);
+    WiFi.mode(provisioningMode ? WIFI_AP : WIFI_OFF);
     delay(120);
   }
 
-  WiFi.mode(WIFI_STA);
+  WiFi.mode(provisioningMode ? WIFI_AP_STA : WIFI_STA);
   WiFi.setAutoReconnect(true);
   WiFi.setSleep(false);
   WiFi.persistent(false);
@@ -2314,17 +2543,18 @@ void beginWiFiConnection(bool resetBeforeBegin = false)
                   preferredWiFiBssid[0], preferredWiFiBssid[1], preferredWiFiBssid[2],
                   preferredWiFiBssid[3], preferredWiFiBssid[4], preferredWiFiBssid[5],
                   (int)preferredWiFiChannel);
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD, preferredWiFiChannel, preferredWiFiBssid, true);
+    WiFi.begin(configuredWiFiSsid, configuredWiFiPassword, preferredWiFiChannel, preferredWiFiBssid, true);
   }
   else
   {
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    WiFi.begin(configuredWiFiSsid, configuredWiFiPassword);
   }
   WiFi.setTxPower(WIFI_TX_POWER_LEVEL);
   Serial.printf("Wi-Fi TX power set to level=%d\n", (int)WIFI_TX_POWER_LEVEL);
   lastWiFiBeginAt = millis();
 }
 
+#if ENABLE_LOCAL_API_SERVER
 void setupMDNSService()
 {
   if (!ENABLE_MDNS || !ENABLE_LOCAL_API_SERVER || WiFi.status() != WL_CONNECTED || mdnsStarted)
@@ -2373,10 +2603,56 @@ void stopMDNSService()
   mdnsStarted = false;
   Serial.println("mDNS stopped.");
 }
+#endif
 
 void maintainWiFiConnection()
 {
-  if ((!ENABLE_LOCAL_API_SERVER && !ENABLE_EMAIL_ALERTS) || !hasWiFiConfig())
+  if (provisioningMode)
+  {
+    if (!provisioningConnectRequested)
+    {
+      return;
+    }
+
+    if ((int32_t)(millis() - provisioningConnectEarliestAt) < 0)
+    {
+      return;
+    }
+
+    if (lastWiFiBeginAt == 0)
+    {
+      Serial.printf("Provisioning connect attempt starting for SSID '%s'\n", configuredWiFiSsid);
+      scanAndLogTargetSSID();
+      beginWiFiConnection(true);
+      return;
+    }
+
+    wl_status_t provisioningStatus = WiFi.status();
+    if (provisioningStatus == WL_CONNECTED)
+    {
+      provisioningState = "connected";
+      provisioningFailureReason = "none";
+      if (provisioningSuccessAt == 0)
+      {
+        provisioningSuccessAt = millis();
+      }
+      return;
+    }
+
+    if (lastWiFiBeginAt != 0 && (uint32_t)(millis() - lastWiFiBeginAt) >= WIFI_CONNECT_TIMEOUT_MS)
+    {
+      provisioningConnectRequested = false;
+      provisioningState = "failed";
+      provisioningFailureReason = (provisioningStatus == WL_NO_SSID_AVAIL) ? "ssid_not_found" : (provisioningStatus == WL_CONNECT_FAILED ? "auth_failed" : "connect_timeout");
+      lastWiFiBeginAt = 0;
+      provisioningConnectEarliestAt = 0;
+      WiFi.disconnect(false, false);
+      WiFi.mode(WIFI_AP);
+    }
+    return;
+  }
+
+  if (!hasWiFiConfig())
   {
     return;
   }
@@ -2385,6 +2661,21 @@ void maintainWiFiConnection()
   wl_status_t status = WiFi.status();
   if (status == WL_CONNECTED)
   {
+    if (wifiConnectWindowStartedAt != 0)
+    {
+      wifiConnectWindowStartedAt = 0;
+    }
+    return;
+  }
+
+  if (wifiConnectWindowStartedAt == 0)
+  {
+    wifiConnectWindowStartedAt = now;
+  }
+
+  if ((uint32_t)(now - wifiConnectWindowStartedAt) >= WIFI_PROVISIONING_FALLBACK_MS)
+  {
+    startProvisioningMode("wifi_connect_timeout");
     return;
   }
 
@@ -2427,12 +2718,16 @@ void notifyWiFiTransition()
   lastWiFiConnected = connected;
   if (connected)
   {
+#if ENABLE_LOCAL_API_SERVER
     setupMDNSService();
+#endif
     setAlertMessage("System reconnected successfully.");
   }
   else
   {
+#if ENABLE_LOCAL_API_SERVER
     stopMDNSService();
+#endif
     setAlertMessage("Connection lost. Attempting to reconnect.");
   }
 }
@@ -3118,15 +3413,27 @@ void emitReadings(uint8_t zoneIndex, const ZoneReadings &r)
 
 void writeLCDLines(const char *line1, const char *line2, const char *line3, const char *line4)
 {
-  lcd.clear();
-  lcd.setCursor(0, 0);
-  lcd.print(line1);
-  lcd.setCursor(0, 1);
-  lcd.print(line2);
-  lcd.setCursor(0, 2);
-  lcd.print(line3);
-  lcd.setCursor(0, 3);
-  lcd.print(line4);
+  const char *lines[LCD_ROWS] = {line1, line2, line3, line4};
+
+  if (lcdNeedsFullRefresh)
+  {
+    lcd.clear();
+  }
+
+  for (uint8_t row = 0; row < LCD_ROWS; row++)
+  {
+    if (!lcdNeedsFullRefresh && strncmp(lastLCDLines[row], lines[row], LCD_COLS) == 0)
+    {
+      continue;
+    }
+
+    lcd.setCursor(0, row);
+    lcd.print(lines[row]);
+    strncpy(lastLCDLines[row], lines[row], LCD_COLS);
+    lastLCDLines[row][LCD_COLS] = '\0';
+  }
+
+  lcdNeedsFullRefresh = false;
 }
 
 void formatMMSS(uint32_t durationMs, char *out, size_t outSize)
@@ -3156,33 +3463,77 @@ void renderLCDPage()
   line3[20] = '\0';
   line4[20] = '\0';
 
+  if (provisioningMode)
+  {
+    snprintf(line1, sizeof(line1), "Setup mode");
+    snprintf(line2, sizeof(line2), "%s", provisioningApSsid().c_str());
+    if (provisioningState == "connecting")
+    {
+      snprintf(line3, sizeof(line3), "Joining Wi-Fi...");
+      snprintf(line4, sizeof(line4), "%s", configuredWiFiSsid);
+    }
+    else if (provisioningState == "connected")
+    {
+      snprintf(line3, sizeof(line3), "Connected");
+      snprintf(line4, sizeof(line4), "%s", WiFi.localIP().toString().c_str());
+    }
+    else if (provisioningState == "failed")
+    {
+      snprintf(line3, sizeof(line3), "Wi-Fi failed");
+      snprintf(line4, sizeof(line4), "%s", provisioningFailureReason.c_str());
+    }
+    else
+    {
+      snprintf(line3, sizeof(line3), "Scan QR in app");
+      snprintf(line4, sizeof(line4), "Open 192.168.4.1");
+    }
+
+    writeLCDLines(line1, line2, line3, line4);
+    return;
+  }
+
   uint32_t phaseDurationMs = (phase == PHASE_IDLE) ? IDLE_DURATION_MS : ACTIVE_DURATION_MS;
   uint32_t phaseElapsedMs = (uint32_t)(millis() - phaseStartedAt);
   uint32_t phaseRemainingMs = (phaseElapsedMs < phaseDurationMs) ? (phaseDurationMs - phaseElapsedMs) : 0;
   char remainingText[6];
   formatMMSS(phaseRemainingMs, remainingText, sizeof(remainingText));
 
-  const char *phaseShort = (phase == PHASE_IDLE) ? "IDLE" : "ACTV";
-  const char *wifiShort = (WiFi.status() == WL_CONNECTED) ? "OK" : "NO";
-  const char *waterShort = waterValveOpen ? "ON" : "OFF";
-  const char *nutrientShort = nutrientValveOpen ? "ON" : "OFF";
+  const char *phaseText = (phase == PHASE_IDLE) ? "Idle" : "Active";
+  const char *wifiText = (WiFi.status() == WL_CONNECTED) ? "On" : "Off";
+  const char *waterText = waterValveOpen ? "On" : "Off";
+  const char *nutrientText = nutrientValveOpen ? "On" : "Off";
 
   String moisture1 = hasLatestReadings[0] ? String((int)(latestReadings[0].moisturePct + 0.5f)) : String("--");
   String moisture2 = hasLatestReadings[1] ? String((int)(latestReadings[1].moisturePct + 0.5f)) : String("--");
 
   if (latestTankLow)
   {
-    snprintf(line1, sizeof(line1), "!!! TANK LOW !!!");
-    snprintf(line2, sizeof(line2), "REFILL WATER TANK");
-    snprintf(line3, sizeof(line3), "WATER VALVE BLOCKED");
-    snprintf(line4, sizeof(line4), "Z1:%s Z2:%s Wi:%s", moisture1.c_str(), moisture2.c_str(), wifiShort);
+    snprintf(line1, sizeof(line1), "Water tank is low");
+    snprintf(line2, sizeof(line2), "Refill tank soon");
+    snprintf(line3, sizeof(line3), "Watering paused");
+    snprintf(line4, sizeof(line4), "Wi-Fi: %s", wifiText);
+  }
+  else if (currentLCDPage == 0)
+  {
+    snprintf(line1, sizeof(line1), "%s Cycle %lu", phaseText, (unsigned long)cycleCount);
+    snprintf(line2, sizeof(line2), "Wi-Fi %s", wifiText);
+    snprintf(line3, sizeof(line3), "Time left %s", remainingText);
+    snprintf(line4, sizeof(line4), "Water tank OK");
+  }
+  else if (currentLCDPage == 1)
+  {
+    snprintf(line1, sizeof(line1), "Zone 1 moisture %s%%", moisture1.c_str());
+    snprintf(line2, sizeof(line2), "Zone 2 moisture %s%%", moisture2.c_str());
+    snprintf(line3, sizeof(line3), "Water valve %s", waterText);
+    snprintf(line4, sizeof(line4), "Nutrient %s", nutrientText);
   }
   else
   {
-    snprintf(line1, sizeof(line1), "%s Cy:%lu Wi:%s", phaseShort, (unsigned long)cycleCount, wifiShort);
-    snprintf(line2, sizeof(line2), "Tank:OK  Rem:%s", remainingText);
-    snprintf(line3, sizeof(line3), "Mois Z1:%s Z2:%s", moisture1.c_str(), moisture2.c_str());
-    snprintf(line4, sizeof(line4), "Valve W:%s N:%s", waterShort, nutrientShort);
+    String ipText = (WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString() : String("not connected");
+    snprintf(line1, sizeof(line1), "Network status");
+    snprintf(line2, sizeof(line2), "Wi-Fi: %s", wifiText);
+    snprintf(line3, sizeof(line3), "%s", ipText.c_str());
+    snprintf(line4, sizeof(line4), "%s", deviceId().c_str());
   }
 
   writeLCDLines(line1, line2, line3, line4);
@@ -3191,7 +3542,17 @@ void renderLCDPage()
 void updateLCD()
 {
   uint32_t now = millis();
-  if ((uint32_t)(now - lastLCDUpdateAt) < LCD_PAGE_INTERVAL_MS)
+  if (!latestTankLow && (uint32_t)(now - lastLCDPageSwitchAt) >= LCD_PAGE_ROTATE_INTERVAL_MS)
+  {
+    currentLCDPage = (currentLCDPage + 1) % 3;
+    lastLCDPageSwitchAt = now;
+  }
+  else if (latestTankLow)
+  {
+    lastLCDPageSwitchAt = now;
+  }
+
+  if ((uint32_t)(now - lastLCDUpdateAt) < LCD_REFRESH_INTERVAL_MS)
   {
     return;
   }
@@ -3200,6 +3561,562 @@ void updateLCD()
   renderLCDPage();
 }
 
+String jsonEscape(const String &input)
+{
+  String out;
+  out.reserve(input.length() + 8);
+
+  for (size_t i = 0; i < input.length(); i++)
+  {
+    char c = input[i];
+    switch (c)
+    {
+    case '"':
+      out += "\\\"";
+      break;
+    case '\\':
+      out += "\\\\";
+      break;
+    case '\n':
+      out += "\\n";
+      break;
+    case '\r':
+      out += "\\r";
+      break;
+    case '\t':
+      out += "\\t";
+      break;
+    default:
+      out += c;
+      break;
+    }
+  }
+
+  return out;
+}
+
+bool extractJsonStringField(const String &json, const char *fieldName, String &outValue)
+{
+  String needle = String("\"") + fieldName + "\"";
+  int keyStart = json.indexOf(needle);
+  if (keyStart < 0)
+  {
+    return false;
+  }
+
+  int colon = json.indexOf(':', keyStart + needle.length());
+  if (colon < 0)
+  {
+    return false;
+  }
+
+  int valueStart = json.indexOf('"', colon + 1);
+  if (valueStart < 0)
+  {
+    return false;
+  }
+
+  String value;
+  bool escaping = false;
+  for (int i = valueStart + 1; i < json.length(); i++)
+  {
+    char c = json[i];
+    if (escaping)
+    {
+      switch (c)
+      {
+      case 'n':
+        value += '\n';
+        break;
+      case 'r':
+        value += '\r';
+        break;
+      case 't':
+        value += '\t';
+        break;
+      default:
+        value += c;
+        break;
+      }
+      escaping = false;
+      continue;
+    }
+
+    if (c == '\\')
+    {
+      escaping = true;
+      continue;
+    }
+
+    if (c == '"')
+    {
+      outValue = value;
+      return true;
+    }
+
+    value += c;
+  }
+
+  return false;
+}
+
+void sendResponseHeaders()
+{
+  apiServer.sendHeader("Access-Control-Allow-Origin", "*");
+  apiServer.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+  apiServer.sendHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  apiServer.sendHeader("Cache-Control", "no-store");
+}
+
+void sendJsonResponse(int statusCode, const String &body)
+{
+  sendResponseHeaders();
+  apiServer.send(statusCode, "application/json", body);
+}
+
+void sendTextResponse(int statusCode, const String &body)
+{
+  sendResponseHeaders();
+  apiServer.send(statusCode, "text/plain", body);
+}
+
+String buildQrPayloadJSON()
+{
+  String json;
+  json.reserve(192);
+  json += "{";
+  json += "\"v\":1,";
+  json += "\"model\":\"NRS-C3\",";
+  json += "\"deviceId\":\"";
+  json += jsonEscape(deviceId());
+  json += "\",";
+  json += "\"setupAp\":\"";
+  json += jsonEscape(provisioningApSsid());
+  json += "\",";
+  json += "\"setupIp\":\"192.168.4.1\"";
+  json += "}";
+  return json;
+}
+
+String buildStatusJSON()
+{
+  uint32_t uptimeMs = millis();
+  uint32_t sampleAgeMs = haveCompleteTelemetry() ? (uint32_t)(uptimeMs - lastTelemetrySampleAtMs) : 0;
+  uint32_t phaseDurationMs = (phase == PHASE_IDLE) ? IDLE_DURATION_MS : ACTIVE_DURATION_MS;
+  uint32_t phaseElapsedMs = (phaseStartedAt > 0) ? (uint32_t)(uptimeMs - phaseStartedAt) : 0;
+  if (phaseElapsedMs > phaseDurationMs)
+  {
+    phaseElapsedMs = phaseDurationMs;
+  }
+  uint32_t phaseRemainingMs = (phaseElapsedMs < phaseDurationMs) ? (phaseDurationMs - phaseElapsedMs) : 0;
+
+  String json;
+  json.reserve(2800);
+  json += "{";
+  json += "\"deviceName\":\"";
+  json += jsonEscape(DEVICE_NAME);
+  json += "\",";
+  json += "\"deviceId\":\"";
+  json += jsonEscape(deviceId());
+  json += "\",";
+  json += "\"firmwareVersion\":\"";
+  json += jsonEscape(FIRMWARE_VERSION);
+  json += "\",";
+  json += "\"apiVersion\":\"";
+  json += jsonEscape(API_VERSION);
+  json += "\",";
+  json += "\"mode\":\"";
+  json += provisioningMode ? "provisioning" : "normal";
+  json += "\",";
+  json += "\"phase\":\"";
+  json += phaseText();
+  json += "\",";
+  json += "\"cycle\":";
+  json += String(cycleCount);
+  json += ",";
+  json += "\"phaseDurationMs\":";
+  json += String(phaseDurationMs);
+  json += ",";
+  json += "\"phaseElapsedMs\":";
+  json += String(phaseElapsedMs);
+  json += ",";
+  json += "\"phaseRemainingMs\":";
+  json += String(phaseRemainingMs);
+  json += ",";
+  json += "\"tankLow\":";
+  json += latestTankLow ? "true" : "false";
+  json += ",";
+  json += "\"tankDistanceCm\":";
+  json += isnan(latestTankDistanceCm) ? "null" : String(latestTankDistanceCm, 2);
+  json += ",";
+  json += "\"lastWaterPulseMs\":";
+  json += String(lastWaterPulseMs);
+  json += ",";
+  json += "\"lastNutrientPulseMs\":";
+  json += String(lastNutrientPulseMs);
+  json += ",";
+  json += "\"lastCycleElapsedMs\":";
+  json += String(lastCycleElapsedMs);
+  json += ",";
+  json += "\"lastCycleCompletedAtMs\":";
+  json += String(lastCycleCompletedAtMs);
+  json += ",";
+  json += "\"uptimeMs\":";
+  json += String(uptimeMs);
+  json += ",";
+  json += "\"lastTelemetrySampleAtMs\":";
+  json += String(lastTelemetrySampleAtMs);
+  json += ",";
+  json += "\"sampleAgeMs\":";
+  json += String(sampleAgeMs);
+  json += ",";
+  json += "\"criticalNutrientLockout\":";
+  json += lastCycleCriticalNutrientLockout ? "true" : "false";
+  json += ",";
+  json += "\"waterValveOpen\":";
+  json += waterValveOpen ? "true" : "false";
+  json += ",";
+  json += "\"nutrientValveOpen\":";
+  json += nutrientValveOpen ? "true" : "false";
+  json += ",";
+  json += "\"lastAlert\":\"";
+  json += jsonEscape(lastAlertMessage);
+  json += "\",";
+  json += "\"wifi\":{";
+  json += "\"connected\":";
+  json += (WiFi.status() == WL_CONNECTED) ? "true" : "false";
+  json += ",\"ssid\":\"";
+  json += jsonEscape(String(configuredWiFiSsid));
+  json += "\",\"ip\":\"";
+  json += currentNetworkIp();
+  json += "\",\"rssi\":";
+  json += (WiFi.status() == WL_CONNECTED) ? String(WiFi.RSSI()) : String(-127);
+  json += "},";
+  json += "\"provisioning\":{";
+  json += "\"active\":";
+  json += provisioningMode ? "true" : "false";
+  json += ",\"state\":\"";
+  json += jsonEscape(provisioningState);
+  json += "\",\"failureReason\":\"";
+  json += jsonEscape(provisioningFailureReason);
+  json += "\",\"setupAp\":\"";
+  json += jsonEscape(provisioningApSsid());
+  json += "\"},";
+  json += "\"zones\":[";
+  for (uint8_t i = 0; i < NUM_ZONES; i++)
+  {
+    if (i > 0)
+    {
+      json += ",";
+    }
+
+    json += "{";
+    json += "\"zone\":";
+    json += String(i + 1);
+    json += ",\"hasData\":";
+    json += hasLatestReadings[i] ? "true" : "false";
+    if (hasLatestReadings[i])
+    {
+      float nutrientPpm = nutrientPpmFromNPK(latestReadings[i].npk);
+      json += ",\"soilMoisturePct\":";
+      json += String(latestReadings[i].moisturePct, 2);
+      json += ",\"tempC\":";
+      json += String(latestReadings[i].tempC, 2);
+      json += ",\"humidityPct\":";
+      json += String(latestReadings[i].humidityPct, 2);
+      json += ",\"nutrientPpm\":";
+      json += String(nutrientPpm, 2);
+      json += ",\"moistureBand\":\"";
+      json += moistureBandText(latestReadings[i].moisturePct);
+      json += "\",\"tempBand\":\"";
+      json += temperatureBandText(latestReadings[i].tempC);
+      json += "\",\"humidityBand\":\"";
+      json += humidityBandText(latestReadings[i].humidityPct);
+      json += "\",\"nutrientBand\":\"";
+      json += nutrientBandText(nutrientPpm);
+      json += "\",\"npk\":{";
+      json += "\"n\":";
+      json += String(latestReadings[i].npk.n, 2);
+      json += ",\"p\":";
+      json += String(latestReadings[i].npk.p, 2);
+      json += ",\"k\":";
+      json += String(latestReadings[i].npk.k, 2);
+      json += "}";
+    }
+    json += "}";
+  }
+  json += "]";
+  json += "}";
+  return json;
+}
+
+String buildInfoJSON()
+{
+  String json;
+  json.reserve(1200);
+  json += "{";
+  json += "\"deviceName\":\"";
+  json += jsonEscape(DEVICE_NAME);
+  json += "\",";
+  json += "\"deviceId\":\"";
+  json += jsonEscape(deviceId());
+  json += "\",";
+  json += "\"firmwareVersion\":\"";
+  json += jsonEscape(FIRMWARE_VERSION);
+  json += "\",";
+  json += "\"apiVersion\":\"";
+  json += jsonEscape(API_VERSION);
+  json += "\",";
+  json += "\"methodologyProfile\":\"";
+  json += jsonEscape(METHODOLOGY_PROFILE);
+  json += "\",";
+  json += "\"numZones\":";
+  json += String(NUM_ZONES);
+  json += ",";
+  json += "\"telemetryRefreshMs\":";
+  json += String(TELEMETRY_REFRESH_INTERVAL_MS);
+  json += ",";
+  json += "\"appApiEnabled\":true,";
+  json += "\"localApiEnabled\":";
+  json += ENABLE_LOCAL_API_SERVER ? "true" : "false";
+  json += ",";
+  json += "\"mode\":\"";
+  json += provisioningMode ? "provisioning" : "normal";
+  json += "\",";
+  json += "\"setupAp\":\"";
+  json += jsonEscape(provisioningApSsid());
+  json += "\",";
+  json += "\"setupIp\":\"192.168.4.1\",";
+  json += "\"qrPayload\":";
+  json += buildQrPayloadJSON();
+  json += ",";
+  json += "\"uptimeMs\":";
+  json += String(millis());
+  json += "}";
+  return json;
+}
+
+String buildProvisioningInfoJSON()
+{
+  String json;
+  json.reserve(512);
+  json += "{";
+  json += "\"deviceName\":\"";
+  json += jsonEscape(DEVICE_NAME);
+  json += "\",";
+  json += "\"deviceId\":\"";
+  json += jsonEscape(deviceId());
+  json += "\",";
+  json += "\"mode\":\"";
+  json += provisioningMode ? "provisioning" : "normal";
+  json += "\",";
+  json += "\"apSsid\":\"";
+  json += jsonEscape(provisioningApSsid());
+  json += "\",";
+  json += "\"setupIp\":\"192.168.4.1\",";
+  json += "\"firmwareVersion\":\"";
+  json += jsonEscape(FIRMWARE_VERSION);
+  json += "\",";
+  json += "\"status\":\"";
+  json += jsonEscape(provisioningState);
+  json += "\"}";
+  return json;
+}
+
+String buildProvisioningResultJSON()
+{
+  String json;
+  json.reserve(384);
+  json += "{";
+  json += "\"state\":\"";
+  json += jsonEscape(provisioningState);
+  json += "\"";
+  if (provisioningFailureReason.length() > 0 && provisioningFailureReason != "none")
+  {
+    json += ",\"reason\":\"";
+    json += jsonEscape(provisioningFailureReason);
+    json += "\"";
+  }
+  if (WiFi.status() == WL_CONNECTED)
+  {
+    json += ",\"ip\":\"";
+    json += WiFi.localIP().toString();
+    json += "\",\"ssid\":\"";
+    json += jsonEscape(String(configuredWiFiSsid));
+    json += "\"";
+  }
+  json += "}";
+  return json;
+}
+
+String buildHealthJSON()
+{
+  String json;
+  json.reserve(128);
+  json += "{";
+  json += "\"status\":\"ok\",";
+  json += "\"mode\":\"";
+  json += provisioningMode ? "provisioning" : "normal";
+  json += "\"}";
+  return json;
+}
+
+void handleOptions()
+{
+  sendResponseHeaders();
+  apiServer.send(204, "text/plain", "");
+}
+
+void handleRoot()
+{
+  sendJsonResponse(200, buildInfoJSON());
+}
+
+void handleStatus()
+{
+  sendJsonResponse(200, buildStatusJSON());
+}
+
+void handleInfo()
+{
+  sendJsonResponse(200, buildInfoJSON());
+}
+
+void handleHealth()
+{
+  sendJsonResponse(200, buildHealthJSON());
+}
+
+void handleProvisioningInfo()
+{
+  sendJsonResponse(200, buildProvisioningInfoJSON());
+}
+
+void handleProvisioningResult()
+{
+  sendJsonResponse(200, buildProvisioningResultJSON());
+}
+
+void handleProvisioningConfigure()
+{
+  if (!provisioningMode)
+  {
+    sendJsonResponse(409, "{\"error\":\"not_in_provisioning_mode\"}");
+    return;
+  }
+
+  String body = apiServer.arg("plain");
+  String ssid;
+  String password;
+  if (!extractJsonStringField(body, "ssid", ssid) || !extractJsonStringField(body, "password", password))
+  {
+    sendJsonResponse(400, "{\"error\":\"invalid_payload\"}");
+    return;
+  }
+
+  ssid.trim();
+  if (ssid.length() == 0 || ssid.length() > PROVISIONING_MAX_SSID_LEN || password.length() > PROVISIONING_MAX_PASSWORD_LEN)
+  {
+    sendJsonResponse(400, "{\"error\":\"invalid_wifi_credentials\"}");
+    return;
+  }
+
+  if (!saveWiFiCredentials(ssid, password))
+  {
+    sendJsonResponse(500, "{\"error\":\"credential_save_failed\"}");
+    return;
+  }
+
+  provisioningState = "connecting";
+  provisioningFailureReason = "none";
+  provisioningConnectRequested = true;
+  provisioningSuccessAt = 0;
+  lastWiFiBeginAt = 0;
+  provisioningConnectEarliestAt = millis() + 1500UL;
+  Serial.printf("Provisioning credentials accepted for SSID '%s'. Connection will start shortly.\n", configuredWiFiSsid);
+  sendJsonResponse(202, "{\"accepted\":true,\"message\":\"Credentials received. Device is attempting to connect.\"}");
+}
+
+void handleResetWiFi()
+{
+  String body = apiServer.arg("plain");
+  if (body.indexOf("\"confirm\":true") < 0)
+  {
+    sendJsonResponse(400, "{\"error\":\"confirmation_required\"}");
+    return;
+  }
+
+  sendJsonResponse(202, "{\"accepted\":true,\"message\":\"Wi-Fi credentials cleared. Device will restart in setup mode.\"}");
+  delay(150);
+  clearWiFiCredentials();
+  ESP.restart();
+}
+
+void setupApiServer()
+{
+  if (!apiRoutesRegistered)
+  {
+    apiServer.on("/", HTTP_GET, handleRoot);
+    apiServer.on("/", HTTP_OPTIONS, handleOptions);
+    apiServer.on("/api/info", HTTP_GET, handleInfo);
+    apiServer.on("/api/info", HTTP_OPTIONS, handleOptions);
+    apiServer.on("/api/status", HTTP_GET, handleStatus);
+    apiServer.on("/api/status", HTTP_OPTIONS, handleOptions);
+    apiServer.on("/api/provisioning/info", HTTP_GET, handleProvisioningInfo);
+    apiServer.on("/api/provisioning/info", HTTP_OPTIONS, handleOptions);
+    apiServer.on("/api/provisioning/configure", HTTP_POST, handleProvisioningConfigure);
+    apiServer.on("/api/provisioning/configure", HTTP_OPTIONS, handleOptions);
+    apiServer.on("/api/provisioning/result", HTTP_GET, handleProvisioningResult);
+    apiServer.on("/api/provisioning/result", HTTP_OPTIONS, handleOptions);
+    apiServer.on("/api/device/reset-wifi", HTTP_POST, handleResetWiFi);
+    apiServer.on("/api/device/reset-wifi", HTTP_OPTIONS, handleOptions);
+    apiServer.on("/healthz", HTTP_GET, handleHealth);
+    apiServer.on("/healthz", HTTP_OPTIONS, handleOptions);
+    apiServer.onNotFound([]()
+                    { sendJsonResponse(404, "{\"error\":\"not_found\"}"); });
+    apiRoutesRegistered = true;
+  }
+
+  if (apiServerStarted)
+  {
+    return;
+  }
+
+  if (!provisioningMode && WiFi.status() != WL_CONNECTED)
+  {
+    return;
+  }
+
+  apiServer.begin();
+  apiServerStarted = true;
+  Serial.println("App API server started on port 80.");
+}
+
+void stopApiServer()
+{
+  if (!apiServerStarted)
+  {
+    return;
+  }
+
+  apiServer.stop();
+  apiServerStarted = false;
+  Serial.println("App API server stopped.");
+}
+
+void ensureApiServerState()
+{
+  bool shouldRun = provisioningMode || WiFi.status() == WL_CONNECTED;
+  if (shouldRun)
+  {
+    setupApiServer();
+    return;
+  }
+
+  stopApiServer();
+}
+
+#if ENABLE_LOCAL_API_SERVER
 String jsonEscape(const String &input)
 {
   String out;
@@ -3462,6 +4379,7 @@ String buildInfoJSON()
 
   return json;
 }
+#endif
 
 String base64Encode(const String &input)
 {
@@ -3631,6 +4549,7 @@ void maybeSendTankLowEmail()
   sendEmailAlert(subject, body);
 }
 
+#if ENABLE_LOCAL_API_SERVER
 void sendResponseHeaders()
 {
   webServer.sendHeader("Access-Control-Allow-Origin", "*");
@@ -3707,6 +4626,7 @@ void setupApiServer()
   }
   setAlertMessage(String("Local API online at ") + WiFi.localIP().toString());
 }
+#endif
 
 void executeControlCycle()
 {
@@ -3918,20 +4838,23 @@ void enterPhase(Phase newPhase)
 
 void connectWiFiBlocking()
 {
-  if ((!ENABLE_LOCAL_API_SERVER && !ENABLE_EMAIL_ALERTS) || !hasWiFiConfig())
+  if (!hasWiFiConfig())
   {
-    Serial.println("Wi-Fi disabled or credentials not configured.");
+    Serial.println("No Wi-Fi credentials configured. Starting provisioning mode.");
+    startProvisioningMode("no_credentials");
     return;
   }
 
+  wifiConnectWindowStartedAt = millis();
   scanAndLogTargetSSID();
   beginWiFiConnection();
 
-  Serial.printf("Connecting Wi-Fi SSID: %s\n", WIFI_SSID);
+  Serial.printf("Connecting Wi-Fi SSID: %s\n", configuredWiFiSsid);
   uint32_t startedAt = millis();
 
   while (WiFi.status() != WL_CONNECTED && (uint32_t)(millis() - startedAt) < WIFI_CONNECT_TIMEOUT_MS)
   {
+    serviceNetwork();
     delay(250);
     Serial.print('.');
   }
@@ -3940,6 +4863,7 @@ void connectWiFiBlocking()
   if (WiFi.status() == WL_CONNECTED)
   {
     Serial.printf("Wi-Fi connected. IP: %s\n", WiFi.localIP().toString().c_str());
+    wifiConnectWindowStartedAt = 0;
   }
   else
   {
@@ -3975,10 +4899,11 @@ void setup()
   Wire.begin();
   lcd.init();
   lcd.backlight();
+  lcd.clear();
   writeLCDLines("System booting", "ESP32-C3 online", "Loading sensors", "Please wait");
 
+  loadWiFiCredentials();
   connectWiFiBlocking();
-  setupApiServer();
   lastTelemetrySampleAtMs = millis() - TELEMETRY_REFRESH_INTERVAL_MS;
 
   enterPhase(PHASE_IDLE);
@@ -3989,9 +4914,10 @@ void loop()
 {
   maintainWiFiConnection();
   notifyWiFiTransition();
-  if (ENABLE_LOCAL_API_SERVER && !serverStarted && WiFi.status() == WL_CONNECTED)
+
+  if (provisioningMode && provisioningState == "connected" && provisioningSuccessAt != 0 && (uint32_t)(millis() - provisioningSuccessAt) >= PROVISIONING_SUCCESS_HOLD_MS)
   {
-    setupApiServer();
+    stopProvisioningMode();
   }
 
   refreshTelemetryIfDue();

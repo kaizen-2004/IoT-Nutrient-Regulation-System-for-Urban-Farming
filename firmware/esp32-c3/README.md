@@ -10,7 +10,8 @@ This project now runs fully on **ESP32-C3** (no PC/Go runtime required).
 - 1x tank level sensor for low-water safety
 - 2x relay outputs for water/nutrient solenoid valves
 - 20x4 LCD (I2C) for real-time local monitoring
-- Local HTTP API for a phone dashboard app
+- JSON API for Flutter app monitoring and provisioning
+- SoftAP setup mode for first-time Wi-Fi onboarding and recovery
 - Email alert notification for tank-low events (SMTP)
 
 ## Control Logic
@@ -123,56 +124,49 @@ Use staged bring-up:
 - This shortens debug time and prevents mixed-fault confusion.
 - After all modules pass individually, run one integrated firmware for system validation.
 
-## Local API
+## App API And Provisioning
 
-- Firmware starts a web server on port `80`.
-- Main endpoints:
-  - `http://<esp32-ip>/` (visual dashboard UI)
-  - `http://<esp32-ip>/healthz`
-  - `http://<esp32-ip>/api/info`
-  - `http://<esp32-ip>/api/status`
-- IP can change after reboot unless you reserve a fixed DHCP lease in your router.
-- API responses include CORS headers for the Capacitor mobile app.
-- Live telemetry is refreshed every `3 seconds` by default.
+- The firmware now exposes a lightweight JSON API for the Flutter app.
+- The large embedded browser dashboard remains disabled by default with `#define ENABLE_LOCAL_API_SERVER 0`.
+- The app should use these endpoints instead:
+  - `GET /api/info`
+  - `GET /api/status`
+  - `GET /healthz`
+  - `POST /api/device/reset-wifi`
 
-## Local-Only Fixed Access (No Remote Access)
+### Provisioning Flow
 
-Use this if you want stable local access from phone/laptop without implementing cloud or public access.
+- If saved Wi-Fi credentials exist, the ESP32-C3 tries to join them on boot.
+- If no credentials exist, or connection fails for `5 minutes`, the device starts a setup AP.
+- The setup AP SSID format is `NutrientReg-Setup-<device-suffix>`.
+- In setup mode the Flutter app should call:
+  - `GET /api/provisioning/info`
+  - `POST /api/provisioning/configure`
+  - `GET /api/provisioning/result`
+- After a successful join, the AP stays up briefly so the app can read the result, then the device returns to normal station mode.
 
-1. Connect ESP32-C3 to your Wi-Fi (`WIFI_SSID`, `WIFI_PASSWORD`) and upload firmware.
-2. Open Serial Monitor and note the first assigned IP from:
-   - `Wi-Fi connected. IP: <address>`
-3. In your router admin page, create a DHCP reservation for the ESP32-C3:
-   - Find the ESP device by MAC address in connected clients.
-   - Bind it to a fixed local IP, for example `192.168.1.50`.
-4. Restart ESP32-C3 (or reconnect Wi-Fi), then confirm the API responds at:
-   - `http://192.168.1.50/healthz`
-   - `http://192.168.1.50/api/info`
-   - `http://192.168.1.50/api/status`
-5. Optional: create a local DNS hostname in your router (if supported):
-   - Example: `nila.local -> 192.168.1.50`
-   - Then connect the app to `http://nila.local`
-6. Build and run the mobile app from `apps/mobile-dashboard/`.
+### QR Sticker Payload
 
-### Local Access Requirements
+- Recommended QR payload format:
 
-- Phone and ESP32-C3 must be on the same LAN/subnet.
-- Avoid guest Wi-Fi for either device.
-- Disable AP/client isolation in router settings if devices cannot see each other.
+```json
+{"v":1,"model":"NRS-C3","deviceId":"plantcare-a1b2c3","setupAp":"NutrientReg-Setup-a1b2c3","setupIp":"192.168.4.1"}
+```
 
 ## LCD Pages (20x4)
 
-- Page 1: phase/tank status + zone 1/2 moisture/temp/humidity + Wi-Fi/cycle
-- Page 2: zone 1/2 NPK + last water/nutrient pulse durations
+- Page 1: system status with phase, cycle count, Wi-Fi state, time left, and tank status
+- Page 2: zone moisture for both zones plus water/nutrient valve states
+- Low-tank alert: shows a dedicated warning page with refill guidance and watering pause status
 
 ## Wi-Fi and Email Setup
 
 Edit constants at top of `esp32_c3_controller.ino`:
 
-- `WIFI_SSID`
-- `WIFI_PASSWORD`
-- `ENABLE_LOCAL_API_SERVER`
+- `ENABLE_LOCAL_API_SERVER` (preprocessor define at top of sketch)
 - `TELEMETRY_REFRESH_INTERVAL_MS`
+
+`WIFI_SSID` and `WIFI_PASSWORD` are now left blank by default because the Flutter app provisions them into ESP32 `Preferences` storage.
 
 For email alerts:
 
@@ -193,7 +187,7 @@ For email alerts:
 Built-in with ESP32 core:
 
 - `WiFi.h`
-- `WebServer.h`
+- `WebServer.h` (only if `ENABLE_LOCAL_API_SERVER` is set to `1`)
 - `WiFiClientSecure.h`
 
 ## Upload
