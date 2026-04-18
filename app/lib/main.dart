@@ -3,22 +3,154 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:http/http.dart' as http;
 import 'package:mobile_scanner/mobile_scanner.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
-void main() {
-  runApp(const NutrientRegulationApp());
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await NotificationService.instance.initialize();
+  runApp(const VertiFarmApp());
 }
 
-class NutrientRegulationApp extends StatefulWidget {
-  const NutrientRegulationApp({super.key});
+class NotificationService {
+  NotificationService._();
+
+  static final NotificationService instance = NotificationService._();
+  static const _alertPrefix = 'notification_alert_';
+  static const _tankCooldown = Duration(hours: 6);
+  static const _offlineCooldown = Duration(minutes: 30);
+
+  final FlutterLocalNotificationsPlugin _plugin =
+      FlutterLocalNotificationsPlugin();
+
+  bool _initialized = false;
+  SharedPreferences? _prefs;
+
+  Future<void> initialize() async {
+    if (_initialized) {
+      return;
+    }
+
+    const androidSettings = AndroidInitializationSettings(
+      '@mipmap/ic_launcher',
+    );
+    const iosSettings = DarwinInitializationSettings();
+    const settings = InitializationSettings(
+      android: androidSettings,
+      iOS: iosSettings,
+    );
+
+    await _plugin.initialize(settings);
+    _prefs = await SharedPreferences.getInstance();
+    await _plugin
+        .resolvePlatformSpecificImplementation<
+          AndroidFlutterLocalNotificationsPlugin
+        >()
+        ?.requestNotificationsPermission();
+    await _plugin
+        .resolvePlatformSpecificImplementation<
+          IOSFlutterLocalNotificationsPlugin
+        >()
+        ?.requestPermissions(alert: true, badge: true, sound: true);
+
+    const tankChannel = AndroidNotificationChannel(
+      'nutrient_tank_alerts',
+      'Tank Alerts',
+      description: 'Alerts for low water tank conditions',
+      importance: Importance.high,
+    );
+    const connectivityChannel = AndroidNotificationChannel(
+      'nutrient_connectivity_alerts',
+      'Connectivity Alerts',
+      description: 'Alerts when the controller becomes unreachable',
+      importance: Importance.defaultImportance,
+    );
+    final androidNotifications = _plugin
+        .resolvePlatformSpecificImplementation<
+          AndroidFlutterLocalNotificationsPlugin
+        >();
+    await androidNotifications?.createNotificationChannel(tankChannel);
+    await androidNotifications?.createNotificationChannel(connectivityChannel);
+
+    _initialized = true;
+  }
+
+  Future<void> showLowTankNotification({
+    required String deviceName,
+    required String body,
+  }) async {
+    if (!await _shouldNotify('$deviceName:tankLow', _tankCooldown)) {
+      return;
+    }
+
+    const details = NotificationDetails(
+      android: AndroidNotificationDetails(
+        'nutrient_tank_alerts',
+        'Tank Alerts',
+        channelDescription: 'Alerts for low water tank conditions',
+        importance: Importance.high,
+        priority: Priority.high,
+      ),
+      iOS: DarwinNotificationDetails(),
+    );
+
+    await _plugin.show(1001, '$deviceName: Water tank low', body, details);
+  }
+
+  Future<void> showControllerOfflineNotification({
+    required String deviceName,
+    required String body,
+  }) async {
+    if (!await _shouldNotify('$deviceName:offline', _offlineCooldown)) {
+      return;
+    }
+
+    const details = NotificationDetails(
+      android: AndroidNotificationDetails(
+        'nutrient_connectivity_alerts',
+        'Connectivity Alerts',
+        channelDescription: 'Alerts when the controller becomes unreachable',
+        importance: Importance.defaultImportance,
+        priority: Priority.defaultPriority,
+      ),
+      iOS: DarwinNotificationDetails(),
+    );
+
+    await _plugin.show(1002, '$deviceName: Controller offline', body, details);
+  }
+
+  Future<void> clearAlertState(String alertKey) async {
+    await _prefs?.remove('$_alertPrefix$alertKey');
+  }
+
+  Future<bool> _shouldNotify(String alertKey, Duration cooldown) async {
+    final prefs = _prefs;
+    if (prefs == null) {
+      return true;
+    }
+
+    final key = '$_alertPrefix$alertKey';
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final last = prefs.getInt(key);
+    if (last != null && now - last < cooldown.inMilliseconds) {
+      return false;
+    }
+
+    await prefs.setInt(key, now);
+    return true;
+  }
+}
+
+class VertiFarmApp extends StatefulWidget {
+  const VertiFarmApp({super.key});
 
   @override
-  State<NutrientRegulationApp> createState() => _NutrientRegulationAppState();
+  State<VertiFarmApp> createState() => _VertiFarmAppState();
 }
 
-class _NutrientRegulationAppState extends State<NutrientRegulationApp> {
+class _VertiFarmAppState extends State<VertiFarmApp> {
   DeviceRecord? _device;
   bool _loading = true;
 
@@ -65,7 +197,7 @@ class _NutrientRegulationAppState extends State<NutrientRegulationApp> {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Nutrient Regulation',
+      title: 'VertiFarm',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         colorScheme: ColorScheme.fromSeed(
@@ -93,7 +225,27 @@ class SplashScreen extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return const Scaffold(body: Center(child: CircularProgressIndicator()));
+    return Scaffold(
+      body: Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: const [
+            Icon(Icons.spa, size: 54, color: Color(0xFF2B7A4B)),
+            SizedBox(height: 12),
+            Text(
+              'VertiFarm',
+              style: TextStyle(
+                fontSize: 24,
+                fontWeight: FontWeight.w700,
+                color: Color(0xFF173A2E),
+              ),
+            ),
+            SizedBox(height: 16),
+            CircularProgressIndicator(),
+          ],
+        ),
+      ),
+    );
   }
 }
 
@@ -154,7 +306,7 @@ class DeviceRecord {
   factory DeviceRecord.fromJson(Map<String, dynamic> json) {
     return DeviceRecord(
       deviceId: (json['deviceId'] ?? '') as String,
-      deviceName: (json['deviceName'] ?? 'Vertical Farm Controller') as String,
+      deviceName: (json['deviceName'] ?? 'VertiFarm Controller') as String,
       model: (json['model'] ?? 'NRS-C3') as String,
       setupAp: (json['setupAp'] ?? 'NutrientReg-Setup') as String,
       setupIp: (json['setupIp'] ?? '192.168.4.1') as String,
@@ -260,7 +412,8 @@ class DeviceApi {
 
     if (response.statusCode < 200 || response.statusCode >= 300) {
       throw ApiException(
-        (body['error'] ?? body['message'] ?? 'Request failed') as String,
+        (body['error'] ?? body['reason'] ?? body['message'] ?? 'Request failed')
+            as String,
       );
     }
     return body;
@@ -293,9 +446,103 @@ class DeviceApi {
     return _getJson(host, '/api/status');
   }
 
+  Future<Map<String, dynamic>> triggerManualPump({
+    required String host,
+    required String pumpId,
+    int? durationMs,
+  }) {
+    final body = <String, dynamic>{'pumpId': pumpId};
+    if (durationMs != null) {
+      body['durationMs'] = durationMs;
+    }
+    return _postJson(host, '/api/manual/pump', body);
+  }
+
   Future<Map<String, dynamic>> resetWifi(String host) {
     return _postJson(host, '/api/device/reset-wifi', {'confirm': true});
   }
+}
+
+Future<String?> discoverDeviceIp({
+  required DeviceApi api,
+  required String deviceId,
+  String? preferredIp,
+}) async {
+  final prefixes = <String>[];
+
+  if (preferredIp != null && preferredIp.isNotEmpty) {
+    final lastDot = preferredIp.lastIndexOf('.');
+    if (lastDot > 0) {
+      prefixes.add(preferredIp.substring(0, lastDot + 1));
+    }
+  }
+
+  for (final prefix in const ['192.168.1.', '192.168.0.', '10.0.0.']) {
+    if (!prefixes.contains(prefix)) {
+      prefixes.add(prefix);
+    }
+  }
+
+  for (final prefix in prefixes) {
+    final found = await _scanPrefixForDevice(
+      api: api,
+      prefix: prefix,
+      expectedDeviceId: deviceId,
+    );
+    if (found != null) {
+      return found;
+    }
+  }
+
+  return null;
+}
+
+Future<String?> _scanPrefixForDevice({
+  required DeviceApi api,
+  required String prefix,
+  required String expectedDeviceId,
+}) async {
+  const batchSize = 20;
+  for (int start = 1; start <= 254; start += batchSize) {
+    final futures = <Future<String?>>[];
+    for (
+      int offset = 0;
+      offset < batchSize && start + offset <= 254;
+      offset++
+    ) {
+      final ip = '$prefix${start + offset}';
+      futures.add(
+        _probeDeviceIp(api: api, ip: ip, expectedDeviceId: expectedDeviceId),
+      );
+    }
+
+    final results = await Future.wait(futures);
+    for (final ip in results) {
+      if (ip != null) {
+        return ip;
+      }
+    }
+  }
+  return null;
+}
+
+Future<String?> _probeDeviceIp({
+  required DeviceApi api,
+  required String ip,
+  required String expectedDeviceId,
+}) async {
+  try {
+    final info = await api
+        .fetchInfo(ip)
+        .timeout(const Duration(milliseconds: 900));
+    final foundDeviceId = (info['deviceId'] ?? '') as String;
+    if (foundDeviceId == expectedDeviceId) {
+      return ip;
+    }
+  } catch (_) {
+    return null;
+  }
+  return null;
 }
 
 class OnboardingScreen extends StatefulWidget {
@@ -394,15 +641,49 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('Connect Device')),
+      appBar: AppBar(title: const Text('Add Controller')),
       body: ListView(
         padding: const EdgeInsets.all(20),
         children: [
           _HeroCard(
-            title: 'V380-style onboarding',
+            title: 'Quick device setup',
             subtitle:
-                'Scan the printed QR sticker, connect your phone to the setup AP, and send Wi-Fi credentials to the controller.',
+                'Scan the printed QR sticker, join the controller setup Wi-Fi, then send your home Wi-Fi details.',
             icon: Icons.qr_code_2,
+          ),
+          const SizedBox(height: 16),
+          _SectionCard(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: const [
+                _SectionHeader(
+                  title: 'Before you start',
+                  subtitle:
+                      'Use a 2.4 GHz Wi-Fi network. Keep the controller powered on and close to your phone during setup.',
+                ),
+                SizedBox(height: 14),
+                _OnboardingStep(
+                  number: '1',
+                  title: 'Scan the QR sticker',
+                  body:
+                      'The sticker provides the setup AP name and device identity.',
+                ),
+                SizedBox(height: 10),
+                _OnboardingStep(
+                  number: '2',
+                  title: 'Join the setup Wi-Fi',
+                  body:
+                      'Connect your phone to the temporary NutrientReg-Setup network when asked.',
+                ),
+                SizedBox(height: 10),
+                _OnboardingStep(
+                  number: '3',
+                  title: 'Send home Wi-Fi',
+                  body:
+                      'Enter your router name and password so the controller can move onto your normal network.',
+                ),
+              ],
+            ),
           ),
           const SizedBox(height: 16),
           Card(
@@ -412,7 +693,7 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Text(
-                    'Start setup',
+                    'Start onboarding',
                     style: Theme.of(context).textTheme.titleMedium,
                   ),
                   const SizedBox(height: 12),
@@ -442,28 +723,26 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
           ),
           const SizedBox(height: 16),
           if (_payload != null)
-            Card(
-              child: Padding(
-                padding: const EdgeInsets.all(16),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      'Detected device',
-                      style: Theme.of(context).textTheme.titleMedium,
-                    ),
-                    const SizedBox(height: 12),
-                    _DetailRow(label: 'Model', value: _payload!.model),
-                    _DetailRow(label: 'Device ID', value: _payload!.deviceId),
-                    _DetailRow(label: 'Setup AP', value: _payload!.setupAp),
-                    _DetailRow(label: 'Setup IP', value: _payload!.setupIp),
-                    const SizedBox(height: 16),
-                    FilledButton(
-                      onPressed: _continueProvisioning,
-                      child: const Text('Continue to provisioning'),
-                    ),
-                  ],
-                ),
+            _SectionCard(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const _SectionHeader(
+                    title: 'Controller found',
+                    subtitle:
+                        'The QR code looks valid. Continue to the Wi-Fi handoff step.',
+                  ),
+                  const SizedBox(height: 12),
+                  _DetailRow(label: 'Model', value: _payload!.model),
+                  _DetailRow(label: 'Device ID', value: _payload!.deviceId),
+                  _DetailRow(label: 'Setup AP', value: _payload!.setupAp),
+                  _DetailRow(label: 'Setup IP', value: _payload!.setupIp),
+                  const SizedBox(height: 16),
+                  FilledButton(
+                    onPressed: _continueProvisioning,
+                    child: const Text('Continue to Wi-Fi setup'),
+                  ),
+                ],
               ),
             ),
         ],
@@ -534,7 +813,7 @@ class _ProvisioningScreenState extends State<ProvisioningScreen> {
       }
       setState(() {
         _error =
-            'Could not reach the setup AP. Join ${widget.payload.setupAp} on your phone first.';
+            'Could not reach the controller setup Wi-Fi. Join the controller AP on your phone first. If the AP name differs from the QR sticker, use the AP shown in your Wi-Fi list or on the controller LCD.';
         _status = 'Setup AP is not reachable yet.';
       });
     } finally {
@@ -631,7 +910,11 @@ class _ProvisioningScreenState extends State<ProvisioningScreen> {
     });
 
     try {
-      final detectedIp = await _scanCommonLanRanges(widget.payload.deviceId);
+      final detectedIp = await discoverDeviceIp(
+        api: _api,
+        deviceId: widget.payload.deviceId,
+        preferredIp: _deviceIpController.text.trim(),
+      );
       if (!mounted || detectedIp == null) {
         return;
       }
@@ -640,8 +923,7 @@ class _ProvisioningScreenState extends State<ProvisioningScreen> {
       final info = await _api.fetchInfo(detectedIp);
       final device = DeviceRecord(
         deviceId: (info['deviceId'] ?? widget.payload.deviceId) as String,
-        deviceName:
-            (info['deviceName'] ?? 'Vertical Farm Controller') as String,
+        deviceName: (info['deviceName'] ?? 'VertiFarm Controller') as String,
         model: widget.payload.model,
         setupAp: widget.payload.setupAp,
         setupIp: widget.payload.setupIp,
@@ -661,55 +943,6 @@ class _ProvisioningScreenState extends State<ProvisioningScreen> {
         });
       }
     }
-  }
-
-  Future<String?> _scanCommonLanRanges(String expectedDeviceId) async {
-    const prefixes = ['192.168.1.', '192.168.0.', '10.0.0.'];
-    for (final prefix in prefixes) {
-      final found = await _scanPrefix(prefix, expectedDeviceId);
-      if (found != null) {
-        return found;
-      }
-    }
-    return null;
-  }
-
-  Future<String?> _scanPrefix(String prefix, String expectedDeviceId) async {
-    const batchSize = 20;
-    for (int start = 1; start <= 254; start += batchSize) {
-      final futures = <Future<String?>>[];
-      for (
-        int offset = 0;
-        offset < batchSize && start + offset <= 254;
-        offset++
-      ) {
-        final ip = '$prefix${start + offset}';
-        futures.add(_probeDeviceIp(ip, expectedDeviceId));
-      }
-
-      final results = await Future.wait(futures);
-      for (final ip in results) {
-        if (ip != null) {
-          return ip;
-        }
-      }
-    }
-    return null;
-  }
-
-  Future<String?> _probeDeviceIp(String ip, String expectedDeviceId) async {
-    try {
-      final info = await _api
-          .fetchInfo(ip)
-          .timeout(const Duration(milliseconds: 900));
-      final deviceId = (info['deviceId'] ?? '') as String;
-      if (deviceId == expectedDeviceId) {
-        return ip;
-      }
-    } catch (_) {
-      return null;
-    }
-    return null;
   }
 
   Future<DeviceRecord> _pollProvisioningResult(String setupIp) async {
@@ -743,8 +976,7 @@ class _ProvisioningScreenState extends State<ProvisioningScreen> {
         final info = await _api.fetchInfo(ip);
         return DeviceRecord(
           deviceId: (info['deviceId'] ?? widget.payload.deviceId) as String,
-          deviceName:
-              (info['deviceName'] ?? 'Vertical Farm Controller') as String,
+          deviceName: (info['deviceName'] ?? 'VertiFarm Controller') as String,
           model: widget.payload.model,
           setupAp: widget.payload.setupAp,
           setupIp: widget.payload.setupIp,
@@ -780,8 +1012,7 @@ class _ProvisioningScreenState extends State<ProvisioningScreen> {
       final info = await _api.fetchInfo(ip);
       final device = DeviceRecord(
         deviceId: (info['deviceId'] ?? widget.payload.deviceId) as String,
-        deviceName:
-            (info['deviceName'] ?? 'Vertical Farm Controller') as String,
+        deviceName: (info['deviceName'] ?? 'VertiFarm Controller') as String,
         model: widget.payload.model,
         setupAp: widget.payload.setupAp,
         setupIp: widget.payload.setupIp,
@@ -822,9 +1053,26 @@ class _ProvisioningScreenState extends State<ProvisioningScreen> {
         ),
         const SizedBox(height: 8),
         const Text(
-          'If the setup AP is missing because the controller is already on your home Wi-Fi, enter its LAN IP and open the dashboard directly.',
+          'Two options are available here: the app can auto-detect the controller on your home Wi-Fi, or you can read the IP from the controller LCD and type it manually.',
         ),
         const SizedBox(height: 12),
+        const Text(
+          'Option 1: Auto-detect (recommended)',
+          style: TextStyle(fontWeight: FontWeight.w700),
+        ),
+        const SizedBox(height: 4),
+        Text(
+          _discoveringLanIp
+              ? 'Scanning your local network for this controller now...'
+              : 'After the setup AP handoff, the app will try the saved subnet and common home-network ranges automatically.',
+          style: const TextStyle(color: Color(0xFF5E6B63)),
+        ),
+        const SizedBox(height: 12),
+        const Text(
+          'Option 2: Enter IP from LCD',
+          style: TextStyle(fontWeight: FontWeight.w700),
+        ),
+        const SizedBox(height: 4),
         TextFormField(
           controller: _deviceIpController,
           decoration: const InputDecoration(
@@ -838,13 +1086,6 @@ class _ProvisioningScreenState extends State<ProvisioningScreen> {
           icon: const Icon(Icons.router),
           label: const Text('Open dashboard with this IP'),
         ),
-        const SizedBox(height: 8),
-        Text(
-          _discoveringLanIp
-              ? 'Auto-detect is scanning common home-network ranges...'
-              : 'Auto-detect will also try common home-network ranges after provisioning handoff.',
-          style: const TextStyle(color: Color(0xFF5E6B63)),
-        ),
       ],
     );
   }
@@ -852,28 +1093,29 @@ class _ProvisioningScreenState extends State<ProvisioningScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('Provision Device')),
+      appBar: AppBar(title: const Text('Wi-Fi Setup')),
       body: ListView(
         padding: const EdgeInsets.all(20),
         children: [
           _HeroCard(
-            title: 'Connect to setup AP first',
+            title: 'Join the controller Wi-Fi first',
             subtitle:
-                'On both Android and iPhone, join ${widget.payload.setupAp} in Wi-Fi settings before checking the setup connection below.',
+                'In your phone Wi-Fi settings, connect to ${widget.payload.setupAp}. Then come back here and continue the handoff.',
             icon: Icons.wifi,
           ),
           const SizedBox(height: 16),
-          Card(
+          _SectionCard(
             child: Padding(
-              padding: const EdgeInsets.all(16),
+              padding: const EdgeInsets.all(4),
               child: Form(
                 key: _formKey,
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text(
-                      'Setup connection',
-                      style: Theme.of(context).textTheme.titleMedium,
+                    const _SectionHeader(
+                      title: 'Step 1: Confirm setup Wi-Fi',
+                      subtitle:
+                          'Check that your phone can still reach the temporary controller network before sending credentials.',
                     ),
                     const SizedBox(height: 12),
                     TextFormField(
@@ -891,7 +1133,7 @@ class _ProvisioningScreenState extends State<ProvisioningScreen> {
                     OutlinedButton.icon(
                       onPressed: _busy ? null : _checkSetupAp,
                       icon: const Icon(Icons.network_check),
-                      label: const Text('Check setup AP'),
+                      label: const Text('Check controller setup Wi-Fi'),
                     ),
                     if (_provisioningInfo != null) ...[
                       const SizedBox(height: 12),
@@ -910,15 +1152,16 @@ class _ProvisioningScreenState extends State<ProvisioningScreen> {
                       ),
                     ],
                     const SizedBox(height: 20),
-                    Text(
-                      'Home Wi-Fi',
-                      style: Theme.of(context).textTheme.titleMedium,
+                    const _SectionHeader(
+                      title: 'Step 2: Send home Wi-Fi',
+                      subtitle:
+                          'Use the same 2.4 GHz network your controller should join after setup.',
                     ),
                     const SizedBox(height: 12),
                     TextFormField(
                       controller: _ssidController,
                       decoration: const InputDecoration(
-                        labelText: 'Wi-Fi SSID',
+                        labelText: 'Home Wi-Fi name',
                       ),
                       validator: (value) =>
                           (value == null || value.trim().isEmpty)
@@ -930,7 +1173,7 @@ class _ProvisioningScreenState extends State<ProvisioningScreen> {
                       controller: _passwordController,
                       obscureText: true,
                       decoration: const InputDecoration(
-                        labelText: 'Wi-Fi password',
+                        labelText: 'Home Wi-Fi password',
                       ),
                     ),
                     const SizedBox(height: 16),
@@ -943,10 +1186,18 @@ class _ProvisioningScreenState extends State<ProvisioningScreen> {
                               child: CircularProgressIndicator(strokeWidth: 2),
                             )
                           : const Icon(Icons.send),
-                      label: const Text('Send credentials'),
+                      label: const Text('Connect controller to home Wi-Fi'),
                     ),
                     const SizedBox(height: 12),
-                    Text(_status),
+                    Container(
+                      width: double.infinity,
+                      padding: const EdgeInsets.all(12),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFFF5F8F4),
+                        borderRadius: BorderRadius.circular(16),
+                      ),
+                      child: Text(_status),
+                    ),
                     if (_error != null) ...[
                       const SizedBox(height: 8),
                       Text(
@@ -984,7 +1235,8 @@ class DashboardScreen extends StatefulWidget {
   State<DashboardScreen> createState() => _DashboardScreenState();
 }
 
-class _DashboardScreenState extends State<DashboardScreen> {
+class _DashboardScreenState extends State<DashboardScreen>
+    with WidgetsBindingObserver {
   final _api = const DeviceApi();
   Timer? _pollTimer;
   Map<String, dynamic>? _info;
@@ -995,12 +1247,18 @@ class _DashboardScreenState extends State<DashboardScreen> {
   };
   String? _error;
   bool _busy = false;
+  bool _lowTankNotificationShown = false;
+  bool _offlineNotificationShown = false;
+  bool _discoveringDevice = false;
+  DateTime? _lastDiscoveryAttemptAt;
+  final Set<String> _manualPendingPumpIds = <String>{};
 
   String get _host => widget.device.lastKnownIp;
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _refresh();
     _pollTimer = Timer.periodic(const Duration(seconds: 3), (_) {
       _refresh(silent: true);
@@ -1009,8 +1267,16 @@ class _DashboardScreenState extends State<DashboardScreen> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _pollTimer?.cancel();
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      _refresh();
+    }
   }
 
   Future<void> _refresh({bool silent = false}) async {
@@ -1036,6 +1302,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
         lastKnownIp: newIp,
       );
       await widget.onDeviceUpdated(updated);
+      await _handleStatusNotifications(status, updated.deviceName);
       if (!mounted) {
         return;
       }
@@ -1046,11 +1313,14 @@ class _DashboardScreenState extends State<DashboardScreen> {
         _error = null;
       });
     } catch (error) {
+      await _handleOfflineNotification();
+      _scheduleDiscoveryIfNeeded();
       if (!mounted) {
         return;
       }
       setState(() {
-        _error = error.toString().replaceFirst('Exception: ', '');
+        _error =
+            'Controller unreachable at ${widget.device.lastKnownIp}. Reconnect your phone to the same Wi-Fi network as the controller, then try again.';
       });
     } finally {
       if (mounted) {
@@ -1059,6 +1329,92 @@ class _DashboardScreenState extends State<DashboardScreen> {
         });
       }
     }
+  }
+
+  void _scheduleDiscoveryIfNeeded() {
+    final now = DateTime.now();
+    if (_discoveringDevice) {
+      return;
+    }
+    if (_lastDiscoveryAttemptAt != null &&
+        now.difference(_lastDiscoveryAttemptAt!) <
+            const Duration(seconds: 20)) {
+      return;
+    }
+    _lastDiscoveryAttemptAt = now;
+    unawaited(_rediscoverDeviceIp());
+  }
+
+  Future<void> _rediscoverDeviceIp() async {
+    _discoveringDevice = true;
+    try {
+      final detectedIp = await discoverDeviceIp(
+        api: _api,
+        deviceId: widget.device.deviceId,
+        preferredIp: widget.device.lastKnownIp,
+      );
+      if (detectedIp == null) {
+        return;
+      }
+
+      final info = await _api.fetchInfo(detectedIp);
+      final status = await _api.fetchStatus(detectedIp);
+      final updated = widget.device.copyWith(
+        deviceName: (info['deviceName'] ?? widget.device.deviceName) as String,
+        lastKnownIp: detectedIp,
+      );
+      await widget.onDeviceUpdated(updated);
+      await _handleStatusNotifications(status, updated.deviceName);
+
+      if (!mounted) {
+        return;
+      }
+
+      _recordHistory(status);
+      setState(() {
+        _info = info;
+        _status = status;
+        _error = null;
+      });
+    } catch (_) {
+      return;
+    } finally {
+      _discoveringDevice = false;
+    }
+  }
+
+  Future<void> _handleStatusNotifications(
+    Map<String, dynamic> status,
+    String deviceName,
+  ) async {
+    final tankLow = (status['tankLow'] ?? false) == true;
+    _offlineNotificationShown = false;
+    await NotificationService.instance.clearAlertState('$deviceName:offline');
+
+    if (tankLow && !_lowTankNotificationShown) {
+      _lowTankNotificationShown = true;
+      await NotificationService.instance.showLowTankNotification(
+        deviceName: deviceName,
+        body:
+            'The controller reported a low water tank. Refill the tank soon to avoid watering interruption.',
+      );
+    } else if (!tankLow) {
+      _lowTankNotificationShown = false;
+      await NotificationService.instance.clearAlertState('$deviceName:tankLow');
+    }
+  }
+
+  Future<void> _handleOfflineNotification() async {
+    if (_offlineNotificationShown) {
+      return;
+    }
+
+    _offlineNotificationShown = true;
+    await NotificationService.instance.showControllerOfflineNotification(
+      deviceName: widget.device.deviceName,
+      body:
+          'The app could not reach the controller at ${widget.device.lastKnownIp}. Check power and make sure your phone is on the same Wi-Fi network.',
+    );
   }
 
   void _recordHistory(Map<String, dynamic> status) {
@@ -1124,13 +1480,64 @@ class _DashboardScreenState extends State<DashboardScreen> {
     }
   }
 
+  Future<void> _triggerManualPump(String pumpId) async {
+    if (_manualPendingPumpIds.contains(pumpId)) {
+      return;
+    }
+
+    if (mounted) {
+      setState(() {
+        _manualPendingPumpIds.add(pumpId);
+      });
+    }
+
+    try {
+      final response = await _api.triggerManualPump(
+        host: _host,
+        pumpId: pumpId,
+        durationMs: 6000,
+      );
+      if (!mounted) {
+        return;
+      }
+
+      final durationMs = response['durationMs'];
+      final durationText = durationMs is num
+          ? '${(durationMs / 1000).toStringAsFixed(1)}s'
+          : 'default duration';
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Manual pump $pumpId started for $durationText.'),
+        ),
+      );
+      await _refresh(silent: true);
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(error.toString().replaceFirst('Exception: ', '')),
+        ),
+      );
+    } finally {
+      if (mounted) {
+        setState(() {
+          _manualPendingPumpIds.remove(pumpId);
+        });
+      }
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final status = _status;
     final wifi =
         (status?['wifi'] as Map<String, dynamic>?) ?? const <String, dynamic>{};
     final zones = (status?['zones'] as List<dynamic>?) ?? const <dynamic>[];
-    final isOnline = (wifi['connected'] ?? false) == true;
+    final hasConnectionError = _error != null;
+    final isOnline =
+        !hasConnectionError && (wifi['connected'] ?? false) == true;
 
     return DefaultTabController(
       length: 3,
@@ -1160,23 +1567,36 @@ class _DashboardScreenState extends State<DashboardScreen> {
                   : const Color(0xFFF6DFDF),
               child: ListTile(
                 leading: Icon(isOnline ? Icons.check_circle : Icons.wifi_off),
-                title: Text(isOnline ? 'Device online' : 'Device offline'),
+                title: Text(
+                  isOnline ? 'Controller online' : 'Controller offline',
+                ),
                 subtitle: Text(
                   _error ??
-                      'Polling ${widget.device.lastKnownIp} every 3 seconds',
+                      (isOnline
+                          ? 'Refreshing every 3 seconds'
+                          : (_discoveringDevice
+                                ? 'Trying to rediscover the controller on your local network...'
+                                : 'Reconnect your phone to the same Wi-Fi as the controller, then refresh.')),
                 ),
               ),
             ),
             Expanded(
               child: TabBarView(
                 children: [
-                  _OverviewTab(status: status, histories: _zoneHistory),
+                  _OverviewTab(
+                    status: status,
+                    histories: _zoneHistory,
+                    onManualPumpTrigger: _triggerManualPump,
+                    manualPendingPumpIds: _manualPendingPumpIds,
+                  ),
                   _ZonesTab(zones: zones, histories: _zoneHistory),
                   _DeviceTab(
                     device: widget.device,
                     info: _info,
                     status: status,
                     onResetWifi: _resetWifi,
+                    onManualPumpTrigger: _triggerManualPump,
+                    manualPendingPumpIds: _manualPendingPumpIds,
                   ),
                 ],
               ),
@@ -1189,10 +1609,17 @@ class _DashboardScreenState extends State<DashboardScreen> {
 }
 
 class _OverviewTab extends StatelessWidget {
-  const _OverviewTab({required this.status, required this.histories});
+  const _OverviewTab({
+    required this.status,
+    required this.histories,
+    required this.onManualPumpTrigger,
+    required this.manualPendingPumpIds,
+  });
 
   final Map<String, dynamic>? status;
   final Map<int, _ZoneHistory> histories;
+  final Future<void> Function(String pumpId) onManualPumpTrigger;
+  final Set<String> manualPendingPumpIds;
 
   @override
   Widget build(BuildContext context) {
@@ -1220,6 +1647,22 @@ class _OverviewTab extends StatelessWidget {
       histories[1]?.temperature ?? const <double>[],
       histories[2]?.temperature ?? const <double>[],
     );
+    final manual =
+        (data['manual'] as Map<String, dynamic>?) ?? const <String, dynamic>{};
+    final manualPumps =
+        (manual['pumps'] as List<dynamic>?) ?? const <dynamic>[];
+
+    Map<String, dynamic>? manualPumpById(String id) {
+      for (final entry in manualPumps) {
+        if (entry is! Map<String, dynamic>) {
+          continue;
+        }
+        if ('${entry['pumpId'] ?? ''}' == id) {
+          return entry;
+        }
+      }
+      return null;
+    }
 
     return ListView(
       padding: const EdgeInsets.all(16),
@@ -1253,7 +1696,7 @@ class _OverviewTab extends StatelessWidget {
               ),
               const SizedBox(height: 8),
               Text(
-                'Automated Solar-Powered IoT-Based Monitoring and Nutrient Regulation System for Vertical Urban Farming Using Arduino-Based Sensors',
+                'VertiFarm automated monitoring and nutrient control system',
                 style: const TextStyle(color: Color(0xFFD9ECE2), height: 1.35),
               ),
               const SizedBox(height: 20),
@@ -1267,45 +1710,56 @@ class _OverviewTab extends StatelessWidget {
           ),
         ),
         const SizedBox(height: 16),
-        Row(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Expanded(
-              child: _SpotlightCard(
-                title: 'Average soil wetness',
-                value: avgMoisture == null ? '--' : '${avgMoisture.round()}%',
-                subtitle: avgMoisture == null
-                    ? 'Waiting for live readings'
-                    : _moistureBandLabel(avgMoisture),
-                progress: avgMoisture == null
-                    ? 0
-                    : (avgMoisture / 100).clamp(0, 1),
-                accentColor: const Color(0xFF2F8F62),
+        _SectionCard(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const _SectionHeader(
+                title: 'Readings',
+                subtitle: 'Current combined sensor summary from the controller',
               ),
-            ),
-            const SizedBox(width: 12),
-            Expanded(
-              child: Column(
+              const SizedBox(height: 16),
+              Row(
                 children: [
-                  _SummaryStatCard(
-                    title: 'Plant food',
-                    value: avgNutrient == null
-                        ? '--'
-                        : '${avgNutrient.round()} ppm',
-                    subtitle: avgNutrient == null
-                        ? 'No sample'
-                        : _nutrientBandLabel(avgNutrient),
+                  Expanded(
+                    child: _SpotlightCard(
+                      title: 'Avg Soil Wetness',
+                      value: avgMoisture == null
+                          ? '--'
+                          : '${avgMoisture.round()}%',
+                      subtitle: avgMoisture == null
+                          ? 'Waiting'
+                          : _moistureBandLabel(avgMoisture),
+                      progress: avgMoisture == null
+                          ? 0
+                          : (avgMoisture / 100).clamp(0, 1).toDouble(),
+                      accentColor: const Color(0xFF2F8F62),
+                    ),
                   ),
-                  const SizedBox(height: 12),
-                  _SummaryStatCard(
-                    title: 'Time left',
-                    value: _phaseRemainingText(data),
-                    subtitle: 'Current phase countdown',
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: _SummaryStatCard(
+                      title: 'Plant Food',
+                      value: avgNutrient == null
+                          ? '--'
+                          : '${avgNutrient.round()} ppm',
+                      subtitle: avgNutrient == null
+                          ? 'No sample'
+                          : _nutrientBandLabel(avgNutrient),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: _SummaryStatCard(
+                      title: 'Time Left',
+                      value: _phaseRemainingText(data),
+                      subtitle: 'Current phase',
+                    ),
                   ),
                 ],
               ),
-            ),
-          ],
+            ],
+          ),
         ),
         const SizedBox(height: 16),
         _SectionCard(
@@ -1404,7 +1858,7 @@ class _OverviewTab extends StatelessWidget {
                       value: (data['waterValveOpen'] ?? false) == true
                           ? 'Open'
                           : 'Closed',
-                      subtitle: 'Relay channel 1',
+                      subtitle: 'Channel 1',
                     ),
                   ),
                   const SizedBox(width: 12),
@@ -1414,10 +1868,83 @@ class _OverviewTab extends StatelessWidget {
                       value: (data['nutrientValveOpen'] ?? false) == true
                           ? 'Open'
                           : 'Closed',
-                      subtitle: 'Relay channel 2',
+                      subtitle: 'Channel 2',
                     ),
                   ),
                 ],
+              ),
+              const SizedBox(height: 12),
+              const _SectionHeader(
+                title: 'Manual watering',
+                subtitle: 'Tap a pump to run a timed watering pulse',
+              ),
+              const SizedBox(height: 12),
+              LayoutBuilder(
+                builder: (context, constraints) {
+                  final twoColumns = constraints.maxWidth >= 460;
+                  final children = [
+                    _ManualPumpCard(
+                      title: 'Zone 1 Pump A',
+                      pumpId: 'z1a',
+                      pumpState: manualPumpById('z1a'),
+                      isPending: manualPendingPumpIds.contains('z1a'),
+                      onTrigger: onManualPumpTrigger,
+                    ),
+                    _ManualPumpCard(
+                      title: 'Zone 1 Pump B',
+                      pumpId: 'z1b',
+                      pumpState: manualPumpById('z1b'),
+                      isPending: manualPendingPumpIds.contains('z1b'),
+                      onTrigger: onManualPumpTrigger,
+                    ),
+                    _ManualPumpCard(
+                      title: 'Zone 2 Pump A',
+                      pumpId: 'z2a',
+                      pumpState: manualPumpById('z2a'),
+                      isPending: manualPendingPumpIds.contains('z2a'),
+                      onTrigger: onManualPumpTrigger,
+                    ),
+                    _ManualPumpCard(
+                      title: 'Zone 2 Pump B',
+                      pumpId: 'z2b',
+                      pumpState: manualPumpById('z2b'),
+                      isPending: manualPendingPumpIds.contains('z2b'),
+                      onTrigger: onManualPumpTrigger,
+                    ),
+                  ];
+
+                  if (!twoColumns) {
+                    return Column(
+                      children: [
+                        for (int i = 0; i < children.length; i++) ...[
+                          children[i],
+                          if (i < children.length - 1)
+                            const SizedBox(height: 10),
+                        ],
+                      ],
+                    );
+                  }
+
+                  return Column(
+                    children: [
+                      Row(
+                        children: [
+                          Expanded(child: children[0]),
+                          const SizedBox(width: 10),
+                          Expanded(child: children[1]),
+                        ],
+                      ),
+                      const SizedBox(height: 10),
+                      Row(
+                        children: [
+                          Expanded(child: children[2]),
+                          const SizedBox(width: 10),
+                          Expanded(child: children[3]),
+                        ],
+                      ),
+                    ],
+                  );
+                },
               ),
             ],
           ),
@@ -1609,17 +2136,44 @@ class _DeviceTab extends StatelessWidget {
     required this.info,
     required this.status,
     required this.onResetWifi,
+    required this.onManualPumpTrigger,
+    required this.manualPendingPumpIds,
   });
 
   final DeviceRecord device;
   final Map<String, dynamic>? info;
   final Map<String, dynamic>? status;
   final Future<void> Function() onResetWifi;
+  final Future<void> Function(String pumpId) onManualPumpTrigger;
+  final Set<String> manualPendingPumpIds;
 
   @override
   Widget build(BuildContext context) {
     final wifi =
         (status?['wifi'] as Map<String, dynamic>?) ?? const <String, dynamic>{};
+    final telemetrySource = '${status?['telemetrySource'] ?? 'esp32_local'}';
+    final unoTelemetryAgeMs =
+        (status?['unoTelemetryAgeMs'] as num?)?.toInt() ?? 0;
+    final unoTelemetrySeq = (status?['unoTelemetrySeq'] as num?)?.toInt() ?? 0;
+    final unoTelemetryFresh = (status?['unoTelemetryFresh'] ?? false) == true;
+    final manual =
+        (status?['manual'] as Map<String, dynamic>?) ??
+        const <String, dynamic>{};
+    final manualPumps =
+        (manual['pumps'] as List<dynamic>?) ?? const <dynamic>[];
+
+    Map<String, dynamic>? manualPumpById(String id) {
+      for (final entry in manualPumps) {
+        if (entry is! Map<String, dynamic>) {
+          continue;
+        }
+        if ('${entry['pumpId'] ?? ''}' == id) {
+          return entry;
+        }
+      }
+      return null;
+    }
+
     return ListView(
       padding: const EdgeInsets.all(16),
       children: [
@@ -1679,6 +2233,112 @@ class _DeviceTab extends StatelessWidget {
                 ),
               ],
             ),
+          ),
+        ),
+        const SizedBox(height: 16),
+        _SectionCard(
+          child: Padding(
+            padding: const EdgeInsets.all(4),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const _SectionHeader(
+                  title: 'Serial link diagnostics',
+                  subtitle: 'UNO telemetry freshness and link health',
+                ),
+                const SizedBox(height: 12),
+                _DetailRow(label: 'Telemetry source', value: telemetrySource),
+                _DetailRow(
+                  label: 'Uno telemetry fresh',
+                  value: unoTelemetryFresh ? 'Yes' : 'No',
+                ),
+                _DetailRow(
+                  label: 'Uno telemetry age',
+                  value: '${(unoTelemetryAgeMs / 1000).toStringAsFixed(1)} s',
+                ),
+                _DetailRow(label: 'Uno frame seq', value: '$unoTelemetrySeq'),
+              ],
+            ),
+          ),
+        ),
+        const SizedBox(height: 16),
+        _SectionCard(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const _SectionHeader(
+                title: 'Manual control',
+                subtitle: 'Timed manual pump pulses from the mobile app',
+              ),
+              const SizedBox(height: 12),
+              LayoutBuilder(
+                builder: (context, constraints) {
+                  final twoColumns = constraints.maxWidth >= 460;
+                  final children = [
+                    _ManualPumpCard(
+                      title: 'Zone 1 Pump A',
+                      pumpId: 'z1a',
+                      pumpState: manualPumpById('z1a'),
+                      isPending: manualPendingPumpIds.contains('z1a'),
+                      onTrigger: onManualPumpTrigger,
+                    ),
+                    _ManualPumpCard(
+                      title: 'Zone 1 Pump B',
+                      pumpId: 'z1b',
+                      pumpState: manualPumpById('z1b'),
+                      isPending: manualPendingPumpIds.contains('z1b'),
+                      onTrigger: onManualPumpTrigger,
+                    ),
+                    _ManualPumpCard(
+                      title: 'Zone 2 Pump A',
+                      pumpId: 'z2a',
+                      pumpState: manualPumpById('z2a'),
+                      isPending: manualPendingPumpIds.contains('z2a'),
+                      onTrigger: onManualPumpTrigger,
+                    ),
+                    _ManualPumpCard(
+                      title: 'Zone 2 Pump B',
+                      pumpId: 'z2b',
+                      pumpState: manualPumpById('z2b'),
+                      isPending: manualPendingPumpIds.contains('z2b'),
+                      onTrigger: onManualPumpTrigger,
+                    ),
+                  ];
+
+                  if (!twoColumns) {
+                    return Column(
+                      children: [
+                        for (int i = 0; i < children.length; i++) ...[
+                          children[i],
+                          if (i < children.length - 1)
+                            const SizedBox(height: 10),
+                        ],
+                      ],
+                    );
+                  }
+
+                  return Column(
+                    children: [
+                      Row(
+                        children: [
+                          Expanded(child: children[0]),
+                          const SizedBox(width: 10),
+                          Expanded(child: children[1]),
+                        ],
+                      ),
+                      const SizedBox(height: 10),
+                      Row(
+                        children: [
+                          Expanded(child: children[2]),
+                          const SizedBox(width: 10),
+                          Expanded(child: children[3]),
+                        ],
+                      ),
+                    ],
+                  );
+                },
+              ),
+            ],
           ),
         ),
         const SizedBox(height: 16),
@@ -1793,6 +2453,59 @@ class _HeroCard extends StatelessWidget {
           ],
         ),
       ),
+    );
+  }
+}
+
+class _OnboardingStep extends StatelessWidget {
+  const _OnboardingStep({
+    required this.number,
+    required this.title,
+    required this.body,
+  });
+
+  final String number;
+  final String title;
+  final String body;
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Container(
+          width: 32,
+          height: 32,
+          decoration: const BoxDecoration(
+            color: Color(0xFF1F5A39),
+            shape: BoxShape.circle,
+          ),
+          alignment: Alignment.center,
+          child: Text(
+            number,
+            style: const TextStyle(
+              color: Colors.white,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+        ),
+        const SizedBox(width: 12),
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                title,
+                style: Theme.of(
+                  context,
+                ).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w700),
+              ),
+              const SizedBox(height: 4),
+              Text(body, style: const TextStyle(color: Color(0xFF5E6B63))),
+            ],
+          ),
+        ),
+      ],
     );
   }
 }
@@ -1938,6 +2651,7 @@ class _ProgressStrip extends StatelessWidget {
     );
   }
 }
+
 class _SpotlightCard extends StatelessWidget {
   const _SpotlightCard({
     required this.title,
@@ -1956,54 +2670,49 @@ class _SpotlightCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return _SectionCard(
+      padding: const EdgeInsets.all(12),
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
           Text(
             title,
             textAlign: TextAlign.center,
-            style: Theme.of(context).textTheme.titleMedium?.copyWith(
-              fontWeight: FontWeight.w700,
-            ),
+            style: Theme.of(
+              context,
+            ).textTheme.bodySmall?.copyWith(fontWeight: FontWeight.w700),
           ),
-          const SizedBox(height: 12),
-          const Text(
-            'Current',
-            textAlign: TextAlign.center,
-            style: TextStyle(
-              color: Color(0xFF5E6B63),
-              fontSize: 13,
-            ),
-          ),
-          const SizedBox(height: 4),
+          const SizedBox(height: 6),
           Text(
             value,
             textAlign: TextAlign.center,
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: Theme.of(context).textTheme.headlineMedium?.copyWith(
+            style: Theme.of(context).textTheme.titleLarge?.copyWith(
               fontWeight: FontWeight.w800,
               height: 1.0,
             ),
           ),
-          const SizedBox(height: 14),
+          const SizedBox(height: 8),
           SizedBox(
-            width: 96,
-            height: 96,
-            child: CircularProgressIndicator(
-              value: progress.clamp(0, 1).toDouble(),
-              strokeWidth: 10,
-              backgroundColor: const Color(0xFFE4ECE6),
-              valueColor: AlwaysStoppedAnimation<Color>(accentColor),
+            width: 60,
+            height: 60,
+            child: Stack(
+              alignment: Alignment.center,
+              children: [
+                CircularProgressIndicator(
+                  value: progress.clamp(0, 1),
+                  strokeWidth: 6,
+                  backgroundColor: const Color(0xFFE4ECE6),
+                  valueColor: AlwaysStoppedAnimation<Color>(accentColor),
+                ),
+              ],
             ),
           ),
-          const SizedBox(height: 14),
+          const SizedBox(height: 6),
           Text(
             subtitle,
             textAlign: TextAlign.center,
-            style: const TextStyle(
-              color: Color(0xFF5E6B63),
-            ),
+            style: const TextStyle(color: Color(0xFF5E6B63), fontSize: 10),
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
           ),
         ],
       ),
@@ -2039,6 +2748,80 @@ class _SummaryStatCard extends StatelessWidget {
           ),
           const SizedBox(height: 6),
           Text(subtitle, style: const TextStyle(color: Color(0xFF5E6B63))),
+        ],
+      ),
+    );
+  }
+}
+
+class _ManualPumpCard extends StatelessWidget {
+  const _ManualPumpCard({
+    required this.title,
+    required this.pumpId,
+    required this.pumpState,
+    required this.isPending,
+    required this.onTrigger,
+  });
+
+  final String title;
+  final String pumpId;
+  final Map<String, dynamic>? pumpState;
+  final bool isPending;
+  final Future<void> Function(String pumpId) onTrigger;
+
+  @override
+  Widget build(BuildContext context) {
+    final configured = (pumpState?['configured'] ?? false) == true;
+    final active = (pumpState?['active'] ?? false) == true;
+    final runningRemainingMs =
+        ((pumpState?['runningRemainingMs'] as num?)?.toInt() ?? 0).clamp(
+          0,
+          999999,
+        );
+    final cooldownRemainingMs =
+        ((pumpState?['cooldownRemainingMs'] as num?)?.toInt() ?? 0).clamp(
+          0,
+          999999,
+        );
+
+    final cooldownSeconds = (cooldownRemainingMs / 1000).ceil();
+    final runningSeconds = (runningRemainingMs / 1000).ceil();
+
+    String status = 'Ready';
+    if (!configured) {
+      status = 'Not wired';
+    } else if (isPending) {
+      status = 'Starting...';
+    } else if (active) {
+      status = 'Running ${runningSeconds}s';
+    } else if (cooldownRemainingMs > 0) {
+      status = 'Cooldown ${cooldownSeconds}s';
+    }
+
+    final canRun =
+        configured && !active && cooldownRemainingMs == 0 && !isPending;
+
+    return _SectionCard(
+      padding: const EdgeInsets.all(12),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(title, style: const TextStyle(color: Color(0xFF5E6B63))),
+          const SizedBox(height: 8),
+          Text(
+            status,
+            style: Theme.of(
+              context,
+            ).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700),
+          ),
+          const SizedBox(height: 8),
+          SizedBox(
+            width: double.infinity,
+            child: FilledButton.tonal(
+              onPressed: canRun ? () => unawaited(onTrigger(pumpId)) : null,
+              child: Text(canRun ? 'Run 6s pulse' : 'Unavailable'),
+            ),
+          ),
         ],
       ),
     );

@@ -1,12 +1,17 @@
 #include <Arduino.h>
 #include <HardwareSerial.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
 
-const uint32_t SERIAL_BAUD = 4800;
+const uint32_t SERIAL_BAUD = 115200;
 const uint32_t RS485_BAUD = 9600;
 const uint8_t RS485_TX_PIN = 21;
 const uint8_t RS485_RX_PIN = 20;
 const uint8_t RS485_DE_RE_PIN = 10;
-const bool RS485_DE_RE_TX_HIGH = false;
+const bool RS485_DE_RE_TX_HIGH = true;
+const uint8_t LCD_ADDR = 0x27;
+const uint8_t LCD_COLS = 20;
+const uint8_t LCD_ROWS = 4;
 
 const uint8_t SENSOR_ADDR = 1; // Used when address scan is disabled.
 const uint32_t POLL_MS = 2000;
@@ -16,10 +21,47 @@ const bool ENABLE_ADDRESS_SCAN = true;
 const uint8_t SCAN_ADDR_START = 1;
 const uint8_t SCAN_ADDR_END = 40;
 
+struct RS485Profile
+{
+  const char *label;
+  uint32_t baud;
+  uint32_t config;
+};
+
+const RS485Profile SCAN_PROFILES[] = {
+    {"9600 8N1", 9600, SERIAL_8N1},
+    {"4800 8N1", 4800, SERIAL_8N1},
+    {"2400 8N1", 2400, SERIAL_8N1},
+    {"9600 8E1", 9600, SERIAL_8E1},
+    {"4800 8E1", 4800, SERIAL_8E1},
+    {"2400 8E1", 2400, SERIAL_8E1},
+};
+
 HardwareSerial RS485Serial(1);
+LiquidCrystal_I2C lcd(LCD_ADDR, LCD_COLS, LCD_ROWS);
 
 uint32_t lastPollAt = 0;
 uint32_t pollCount = 0;
+
+void showLCDMessage(const char *line1, const char *line2, const char *line3, const char *line4)
+{
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(line1);
+  lcd.setCursor(0, 1);
+  lcd.print(line2);
+  lcd.setCursor(0, 2);
+  lcd.print(line3);
+  lcd.setCursor(0, 3);
+  lcd.print(line4);
+}
+
+void beginRS485(const RS485Profile &profile)
+{
+  RS485Serial.end();
+  delay(10);
+  RS485Serial.begin(profile.baud, profile.config, RS485_RX_PIN, RS485_TX_PIN);
+}
 
 uint16_t modbusCRC16(const uint8_t *data, uint16_t len)
 {
@@ -148,12 +190,14 @@ void setup()
   Serial.println();
   Serial.println("=== NILA Module Test 06: RS485 NPK Single Sensor ===");
   Serial.printf("RS485 TX=%u RX=%u DE/RE=%u\n", RS485_TX_PIN, RS485_RX_PIN, RS485_DE_RE_PIN);
+  Serial.printf("LCD addr=0x%02X size=%ux%u\n", LCD_ADDR, LCD_COLS, LCD_ROWS);
   if (ENABLE_ADDRESS_SCAN)
   {
-    Serial.printf("Address scan enabled: %u..%u, baud=%lu\n",
+    Serial.printf("Address scan enabled: %u..%u, default baud=%lu\n",
                   SCAN_ADDR_START,
                   SCAN_ADDR_END,
                   (unsigned long)RS485_BAUD);
+    Serial.println("Protocol scan profiles: 9600/4800/2400 with 8N1 and 8E1.");
   }
   else
   {
@@ -165,8 +209,12 @@ void setup()
   setRS485DirectionTx(false);
   pinMode(RS485_RX_PIN, INPUT_PULLUP);
 
-  RS485Serial.begin(RS485_BAUD, SERIAL_8E1, RS485_RX_PIN,
-  RS485_TX_PIN);
+  Wire.begin();
+  lcd.init();
+  lcd.backlight();
+  showLCDMessage("NILA NPK TEST", "LCD + RS485 READY", "Scanning sensor...", "Wait serial output");
+
+  beginRS485(SCAN_PROFILES[0]);
 }
 
 void loop()
@@ -183,33 +231,54 @@ void loop()
 
   if (ENABLE_ADDRESS_SCAN)
   {
-    Serial.printf("[scan %lu] probing addresses %u..%u\n",
+    Serial.printf("[scan %lu] probing addresses %u..%u across %u profiles\n",
                   (unsigned long)pollCount,
                   SCAN_ADDR_START,
-                  SCAN_ADDR_END);
+                  SCAN_ADDR_END,
+                  (unsigned)(sizeof(SCAN_PROFILES) / sizeof(SCAN_PROFILES[0])));
     bool foundAny = false;
-    for (uint8_t addr = SCAN_ADDR_START; addr <= SCAN_ADDR_END; addr++)
+    for (uint8_t profileIndex = 0; profileIndex < (sizeof(SCAN_PROFILES) / sizeof(SCAN_PROFILES[0])); profileIndex++)
     {
-      uint16_t n = 0;
-      uint16_t p = 0;
-      uint16_t k = 0;
-      bool ok = readNPKRegisters(addr, n, p, k, SCAN_RESPONSE_TIMEOUT_MS);
-      if (ok)
+      const RS485Profile &profile = SCAN_PROFILES[profileIndex];
+      beginRS485(profile);
+      Serial.printf("[scan %lu] profile=%s\n", (unsigned long)pollCount, profile.label);
+
+      char line3[21];
+      snprintf(line3, sizeof(line3), "%s", profile.label);
+      showLCDMessage("NILA NPK TEST", "Scanning profile", line3, "Check serial log");
+
+      for (uint8_t addr = SCAN_ADDR_START; addr <= SCAN_ADDR_END; addr++)
       {
-        foundAny = true;
-        Serial.printf("[scan %lu] addr=%u N=%u P=%u K=%u\n",
-                      (unsigned long)pollCount,
-                      addr,
-                      n,
-                      p,
-                      k);
+        uint16_t n = 0;
+        uint16_t p = 0;
+        uint16_t k = 0;
+        bool ok = readNPKRegisters(addr, n, p, k, SCAN_RESPONSE_TIMEOUT_MS);
+        if (ok)
+        {
+          foundAny = true;
+          Serial.printf("[scan %lu] profile=%s addr=%u N=%u P=%u K=%u\n",
+                        (unsigned long)pollCount,
+                        profile.label,
+                        addr,
+                        n,
+                        p,
+                        k);
+          char line2[21];
+          char line3Found[21];
+          char line4[21];
+          snprintf(line2, sizeof(line2), "%s addr:%u", profile.label, addr);
+          snprintf(line3Found, sizeof(line3Found), "N:%u P:%u", n, p);
+          snprintf(line4, sizeof(line4), "K:%u", k);
+          showLCDMessage("NPK VALUES", line2, line3Found, line4);
+        }
+        delay(25);
       }
-      delay(25);
     }
 
     if (!foundAny)
     {
       Serial.printf("[scan %lu] no sensor found in range.\n", (unsigned long)pollCount);
+      showLCDMessage("NILA NPK TEST", "Scan result:", "No sensor found", "Check RS485 path");
     }
     return;
   }
@@ -222,9 +291,19 @@ void loop()
   if (ok)
   {
     Serial.printf("[poll %lu] N=%u P=%u K=%u\n", (unsigned long)pollCount, n, p, k);
+    char line2[21];
+    char line3[21];
+    char line4[21];
+    snprintf(line2, sizeof(line2), "Poll:%lu Addr:%u", (unsigned long)pollCount, SENSOR_ADDR);
+    snprintf(line3, sizeof(line3), "N:%u P:%u", n, p);
+    snprintf(line4, sizeof(line4), "K:%u", k);
+    showLCDMessage("NPK VALUES", line2, line3, line4);
   }
   else
   {
     Serial.printf("[poll %lu] read failed.\n", (unsigned long)pollCount);
+    char line4[21];
+    snprintf(line4, sizeof(line4), "Poll:%lu", (unsigned long)pollCount);
+    showLCDMessage("NPK VALUES", "Read failed", "Check addr/wiring", line4);
   }
 }

@@ -1,0 +1,1 @@
+- Instead of using DHT11, use DS18B20 for temperature sensing:

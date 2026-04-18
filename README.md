@@ -2,20 +2,21 @@
 
 This repository now contains:
 
-- `ESP32-C3 firmware` for sensing, control logic, LCD output, and safety automation
+- `ESP32-C3 controller firmware` for Wi-Fi, LCD, API, and pump control
+- `Arduino Uno sensor bridge firmware` for soil/tank/temp/NPK telemetry
 - `Cloud dashboard direction` (Supabase + Render) on branch `feature/cloud-dashboard`
 
 ## Included Capabilities
 
-- Soil monitoring:
+- Soil monitoring via Uno bridge:
   - 2x capacitive soil moisture sensors
-  - 2x NPK soil sensors via RS485/Modbus (addresses 1 and 2 by default)
-- Ambient monitoring:
-  - 2x DHT22 sensors (temperature/humidity)
+  - NPK telemetry over RS485/Modbus
+- Ambient monitoring via Uno bridge:
+  - DS18B20 probes on 1-wire bus
 - Tank safety:
-  - 1x water tank low-level sensor blocks water valve when tank is low
+  - 1x water tank distance sensor blocks watering when tank is low
 - Actuation:
-  - 2 relay channels driving 2 solenoid valves (water, nutrient)
+  - 4 relay channels driving 4 pumps (`z1a`, `z1b`, `z2a`, `z2b`)
 - Local display:
   - 20x4 LCD (I2C) real-time monitoring pages
 - Network features:
@@ -34,7 +35,8 @@ This repository now contains:
 
 ## Project Structure
 
-- `firmware/esp32-c3/esp32_c3_controller.ino`: main firmware
+- `firmware/esp32-c3/esp32_c3_controller/esp32_c3_controller.ino`: ESP32-C3 controller firmware
+- `firmware/arduino-uno/uno_sensor_bridge/uno_sensor_bridge.ino`: Arduino Uno sensor bridge firmware
 - `firmware/esp32-c3/README.md`: firmware setup, pins, and feature guide
 - `PARTS_LIST.md`: specific components and parts list
 - `HARDWARE_BRINGUP_STATUS.md`: running checklist of module validation progress
@@ -42,24 +44,26 @@ This repository now contains:
 
 ## Getting Started
 
-1. Open `firmware/esp32-c3/esp32_c3_controller.ino` in Arduino IDE.
+1. Open `firmware/esp32-c3/esp32_c3_controller/esp32_c3_controller.ino` in Arduino IDE.
 2. Install board support: **esp32 by Espressif Systems**.
 3. Install Arduino libraries:
    - `DHT sensor library`
    - `LiquidCrystal_I2C`
 4. Configure constants at top of sketch:
    - Email SMTP (`SMTP_HOST`, `SMTP_USERNAME`, `SMTP_PASSWORD`, etc.)
-5. Upload to ESP32-C3.
-6. Open serial monitor for logs.
-7. On first boot, connect the Flutter app to the device setup AP shown on the LCD.
-8. Scan the printed device QR sticker in the app, then send your home `2.4 GHz` Wi-Fi credentials.
-9. Reserve a fixed DHCP IP for the ESP32-C3 in your router after provisioning completes.
-10. Use the app dashboard or serial logs as device-side verification.
+5. Upload ESP32-C3 firmware.
+6. Open and upload `firmware/arduino-uno/uno_sensor_bridge/uno_sensor_bridge.ino` to Arduino Uno.
+7. Wire ESP32/Uno UART and shared GND as listed in `firmware/esp32-c3/README.md`.
+8. Open serial monitor for logs.
+9. On first boot, connect the Flutter app to the device setup AP shown on the LCD.
+10. Scan the printed device QR sticker in the app, then send your home `2.4 GHz` Wi-Fi credentials.
+11. Reserve a fixed DHCP IP for the ESP32-C3 in your router after provisioning completes.
+12. Use the app dashboard or serial logs as device-side verification.
 
 ## App Provisioning Flow
 
 - Device boots with saved Wi-Fi credentials and tries station mode first.
-- If no credentials exist, or Wi-Fi stays unavailable for `5 minutes`, the ESP32-C3 starts a setup AP.
+- If no credentials exist, or Wi-Fi stays unavailable for about `30 seconds`, the ESP32-C3 starts a setup AP.
 - The Flutter app scans the printed QR sticker, connects to the setup AP, and calls:
   - `GET /api/provisioning/info`
   - `POST /api/provisioning/configure`
@@ -82,7 +86,7 @@ Branch-specific firmware details are in `firmware/esp32-c3/README.md`.
 
 ## Notes
 
-- NPK reads use RS485/Modbus (`GPIO21` TX, `GPIO20` RX, `GPIO10` DE/RE by default).
+- Serial link between Uno and ESP32 runs at `19200` baud by default.
+- Protect ESP32 RX with level shifting (Uno TX is 5V).
 - If your relay board is active-low, set `VALVE_ACTIVE_HIGH=false` in firmware.
-- Tank sensor defaults to active-low (`TANK_LEVEL_ACTIVE_LOW=true`).
 - Email alerts are off by default (`ENABLE_EMAIL_ALERTS=false`) until SMTP settings are configured.
