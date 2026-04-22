@@ -1,5 +1,4 @@
 #include <Arduino.h>
-#include <DHT.h>
 #include <HardwareSerial.h>
 #include <LiquidCrystal_I2C.h>
 #include <Preferences.h>
@@ -55,6 +54,15 @@ bool saveWiFiCredentials(const String &ssid, const String &password);
 void clearWiFiCredentials();
 void startProvisioningMode(const char *reason);
 void stopProvisioningMode();
+void pollSetupResetButton();
+void writePumpGroupPins(const uint8_t *pins, uint8_t count, bool open);
+void setupPumpGroupPins(const uint8_t *pins, uint8_t count);
+uint8_t countAssignedPumpPins(const uint8_t *pins, uint8_t count);
+void pollUnoTelemetryLink(bool emitEvents);
+bool parseUnoTelemetryFrame(const char *line, ZoneReadings *outReadings, float &outTankDistanceCm);
+uint8_t xorFrameCrc(const char *text, size_t len);
+void closeAllValves();
+void setAlertMessage(const String &message);
 String buildStatusJSON();
 String buildInfoJSON();
 String buildProvisioningInfoJSON();
@@ -63,15 +71,9 @@ String buildHealthJSON();
 String buildQrPayloadJSON();
 String jsonEscape(const String &input);
 bool extractJsonStringField(const String &json, const char *fieldName, String &outValue);
-bool extractJsonUIntField(const String &json, const char *fieldName, uint32_t &outValue);
-void serviceUnoTelemetryLink();
-bool hasFreshUnoTelemetry();
 String currentNetworkIp();
 String deviceId();
 String provisioningApSsid();
-void serviceManualPumps();
-bool startManualPumpById(const String &pumpId, uint32_t durationMs, String &reason, uint32_t &endsAtMs);
-String buildManualPumpStateJSON();
 #if ENABLE_LOCAL_API_SERVER
 void setupMDNSService();
 void ensureMDNSService();
@@ -123,60 +125,41 @@ const float HUMIDITY_HIGH_WATER_REDUCTION_FACTOR = 0.70f;
 // Relay configuration (set to false if your relay board is active-low)
 const bool VALVE_ACTIVE_HIGH = false;
 
-// HC-SR04 (3.3V variant) tank level configuration.
-// Mount sensor at the tank top pointing downward. Larger distance means lower water level.
-const uint8_t TANK_LEVEL_TRIG_PIN = 5;
-const uint8_t TANK_LEVEL_ECHO_PIN = 10;
+// Tank level threshold (distance from ultrasonic sensor, reported by Uno).
+const float TANK_LOW_DISTANCE_CM = 24.0f; // Tune for your tank geometry.
+const bool TANK_FAILSAFE_LOW_ON_SENSOR_ERROR = false;
+const uint8_t TANK_LEVEL_TRIG_PIN = 2;
+const uint8_t TANK_LEVEL_ECHO_PIN = 3;
 const uint8_t TANK_LEVEL_SAMPLE_COUNT = 5;
 const uint32_t TANK_ULTRASONIC_TIMEOUT_US = 30000UL;
-const float TANK_LOW_DISTANCE_CM = 24.0f; // Tune for your tank geometry.
 const float TANK_MIN_VALID_DISTANCE_CM = 2.0f;
 const float TANK_MAX_VALID_DISTANCE_CM = 300.0f;
-const bool TANK_FAILSAFE_LOW_ON_SENSOR_ERROR = true;
 
 // Pin map for ESP32-C3 (adjust for your exact board wiring)
 const uint8_t WATER_VALVE_PIN = 6;
 const uint8_t NUTRIENT_VALVE_PIN = 7;
-const uint8_t DHT_PINS[NUM_ZONES] = {4, 5};
-const uint8_t MOISTURE_PINS[NUM_ZONES] = {0, 1};
+const uint8_t UNASSIGNED_PUMP_PIN = 255;
+const uint8_t WATER_PUMP_PIN_COUNT = 4;
+const uint8_t NUTRIENT_PUMP_PIN_COUNT = 2;
+const uint8_t WATER_PUMP_PINS[WATER_PUMP_PIN_COUNT] = {
+    WATER_VALVE_PIN,
+    4,
+    3,
+    5};
+const uint8_t NUTRIENT_PUMP_PINS[NUTRIENT_PUMP_PIN_COUNT] = {
+    NUTRIENT_VALVE_PIN,
+    10};
 const uint8_t RS485_TX_PIN = 21;
 const uint8_t RS485_RX_PIN = 20;
-const uint8_t RS485_DE_RE_PIN = 10;
-const bool RS485_DE_RE_TX_HIGH = true;
-const uint32_t RS485_BAUD = 9600;
-const uint8_t NPK_SENSOR_ADDRS[NUM_ZONES] = {1, 2};
-const uint32_t RS485_RESPONSE_TIMEOUT_MS = 500;
-
-const bool USE_UNO_TELEMETRY_LINK = true;
-const bool USE_LOCAL_TANK_SENSOR = true;
-const uint32_t UNO_LINK_BAUD = 19200;
-const uint16_t UNO_TELEMETRY_LINE_MAX = 220;
-const uint32_t UNO_TELEMETRY_STALE_WARN_MS = 5000UL;
-const uint32_t UNO_TELEMETRY_FAILSAFE_MS = 15000UL;
-
-const uint8_t MANUAL_PUMP_COUNT = 4;
-const char *MANUAL_PUMP_IDS[MANUAL_PUMP_COUNT] = {"z1a", "z1b", "z2a", "z2b"};
-const uint8_t ZONE2_PUMP_A_PIN = 4;
-const uint8_t ZONE2_PUMP_B_PIN = 3;
-const int8_t MANUAL_PUMP_PINS[MANUAL_PUMP_COUNT] = {
-    WATER_VALVE_PIN,
-    NUTRIENT_VALVE_PIN,
-    ZONE2_PUMP_A_PIN,
-    ZONE2_PUMP_B_PIN,
-};
-const uint32_t MANUAL_PUMP_DEFAULT_DURATION_MS = 6000UL;
-const uint32_t MANUAL_PUMP_MIN_DURATION_MS = 1000UL;
-const uint32_t MANUAL_PUMP_MAX_DURATION_MS = 12000UL;
-const uint32_t MANUAL_PUMP_COOLDOWN_MS = 15000UL;
-const uint32_t MANUAL_PUMP_RATE_WINDOW_MS = 60000UL;
-const uint8_t MANUAL_PUMP_MAX_PER_WINDOW = 3;
-
-// Moisture calibration per zone (ADC raw values, 12-bit: 0..4095)
-const int MOISTURE_DRY_RAW[NUM_ZONES] = {3000, 3000};
-const int MOISTURE_WET_RAW[NUM_ZONES] = {1300, 1300};
+const uint32_t RS485_BAUD = 19200;
+const float UNO_DEFAULT_HUMIDITY_PCT = 60.0f;
+const uint32_t UNO_TELEMETRY_WAIT_MS = 1200UL;
+const uint32_t UNO_TELEMETRY_STALE_MS = 15000UL;
 
 // LCD 20x4 I2C (PCF8574 backpack)
 const uint8_t LCD_I2C_ADDRESS = 0x27;
+const uint8_t LCD_I2C_SDA_PIN = 8;
+const uint8_t LCD_I2C_SCL_PIN = 9;
 const uint8_t LCD_COLS = 20;
 const uint8_t LCD_ROWS = 4;
 const uint32_t LCD_REFRESH_INTERVAL_MS = 1000UL;
@@ -205,6 +188,12 @@ const uint8_t PROVISIONING_MAX_SSID_LEN = 32;
 const uint8_t PROVISIONING_MAX_PASSWORD_LEN = 64;
 const uint32_t PROVISIONING_SUCCESS_HOLD_MS = 30000UL;
 
+// Hardware fallback setup button.
+// Hold this button to clear Wi-Fi credentials and force setup AP mode.
+const uint8_t SETUP_RESET_BUTTON_PIN = 1;
+const bool SETUP_RESET_BUTTON_ACTIVE_LOW = true;
+const uint32_t SETUP_RESET_HOLD_MS = 4000UL;
+
 // Email alert configuration
 const bool ENABLE_EMAIL_ALERTS = false;
 const char *SMTP_HOST = "smtp.gmail.com";
@@ -223,9 +212,6 @@ Preferences wifiPrefs;
 WebServer webServer(80);
 #endif
 
-DHT dhtZone1(DHT_PINS[0], DHT22);
-DHT dhtZone2(DHT_PINS[1], DHT22);
-DHT *dhtSensors[NUM_ZONES] = {&dhtZone1, &dhtZone2};
 HardwareSerial RS485Serial(1);
 
 ZoneThresholds thresholds[NUM_ZONES] = {
@@ -260,14 +246,6 @@ uint32_t lastCycleCompletedAtMs = 0;
 uint32_t lastTelemetrySampleAtMs = 0;
 bool waterValveOpen = false;
 bool nutrientValveOpen = false;
-uint32_t lastUnoTelemetryAtMs = 0;
-uint32_t lastUnoTelemetrySeq = 0;
-bool unoTelemetryWarnedStale = false;
-bool manualPumpActive[MANUAL_PUMP_COUNT] = {false, false, false, false};
-uint32_t manualPumpEndsAtMs[MANUAL_PUMP_COUNT] = {0, 0, 0, 0};
-uint32_t manualPumpLastStartedAtMs[MANUAL_PUMP_COUNT] = {0, 0, 0, 0};
-uint32_t manualPumpWindowStartedAtMs[MANUAL_PUMP_COUNT] = {0, 0, 0, 0};
-uint8_t manualPumpWindowCount[MANUAL_PUMP_COUNT] = {0, 0, 0, 0};
 
 String lastAlertMessage = "none";
 bool apiServerStarted = false;
@@ -296,6 +274,10 @@ uint32_t lastMDNSRetryAt = 0;
 uint32_t lastEmailSentAt = 0;
 bool lastCycleCriticalNutrientLockout = false;
 bool lastWiFiConnected = false;
+uint32_t setupResetPressedAt = 0;
+bool setupResetHandledForCurrentPress = false;
+char unoFrameBuffer[192] = {0};
+uint8_t unoFrameLength = 0;
 bool wifiStateInitialized = false;
 bool prevMoistureLowState[NUM_ZONES] = {false, false};
 bool prevNutrientLowState[NUM_ZONES] = {false, false};
@@ -2441,7 +2423,6 @@ void setAlertMessage(const String &message)
 
 void serviceNetwork()
 {
-  serviceUnoTelemetryLink();
   ensureApiServerState();
 
   if (apiServerStarted)
@@ -2463,10 +2444,48 @@ void delayWithService(uint32_t delayMs)
   uint32_t startedAt = millis();
   while ((uint32_t)(millis() - startedAt) < delayMs)
   {
+    pollUnoTelemetryLink(false);
+    pollSetupResetButton();
     maintainWiFiConnection();
     serviceNetwork();
     delay(20);
   }
+}
+
+void pollSetupResetButton()
+{
+  bool isPressed = (digitalRead(SETUP_RESET_BUTTON_PIN) == (SETUP_RESET_BUTTON_ACTIVE_LOW ? LOW : HIGH));
+  uint32_t now = millis();
+
+  if (!isPressed)
+  {
+    setupResetPressedAt = 0;
+    setupResetHandledForCurrentPress = false;
+    return;
+  }
+
+  if (setupResetPressedAt == 0)
+  {
+    setupResetPressedAt = now;
+    return;
+  }
+
+  if (setupResetHandledForCurrentPress)
+  {
+    return;
+  }
+
+  if ((uint32_t)(now - setupResetPressedAt) < SETUP_RESET_HOLD_MS)
+  {
+    return;
+  }
+
+  setupResetHandledForCurrentPress = true;
+  Serial.println("[reset] Hardware setup button long-press detected.");
+  setAlertMessage("Setup button held. Entering setup mode.");
+  closeAllValves();
+  clearWiFiCredentials();
+  startProvisioningMode("hardware_button_long_press");
 }
 
 void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info)
@@ -2990,10 +3009,61 @@ uint32_t blendDemandDuration(uint32_t maxDurationMs, uint32_t sumDurationMs, uin
   return out;
 }
 
+void writePumpGroupPins(const uint8_t *pins, uint8_t count, bool open)
+{
+  bool level = open ? VALVE_ACTIVE_HIGH : !VALVE_ACTIVE_HIGH;
+  for (uint8_t i = 0; i < count; i++)
+  {
+    uint8_t pin = pins[i];
+    if (pin == UNASSIGNED_PUMP_PIN)
+    {
+      continue;
+    }
+    digitalWrite(pin, level ? HIGH : LOW);
+  }
+}
+
+void setupPumpGroupPins(const uint8_t *pins, uint8_t count)
+{
+  for (uint8_t i = 0; i < count; i++)
+  {
+    uint8_t pin = pins[i];
+    if (pin == UNASSIGNED_PUMP_PIN)
+    {
+      continue;
+    }
+    pinMode(pin, OUTPUT);
+  }
+}
+
+uint8_t countAssignedPumpPins(const uint8_t *pins, uint8_t count)
+{
+  uint8_t assigned = 0;
+  for (uint8_t i = 0; i < count; i++)
+  {
+    if (pins[i] != UNASSIGNED_PUMP_PIN)
+    {
+      assigned++;
+    }
+  }
+  return assigned;
+}
+
 void setValve(uint8_t pin, bool open)
 {
   bool level = open ? VALVE_ACTIVE_HIGH : !VALVE_ACTIVE_HIGH;
-  digitalWrite(pin, level ? HIGH : LOW);
+  if (pin == WATER_VALVE_PIN)
+  {
+    writePumpGroupPins(WATER_PUMP_PINS, WATER_PUMP_PIN_COUNT, open);
+  }
+  else if (pin == NUTRIENT_VALVE_PIN)
+  {
+    writePumpGroupPins(NUTRIENT_PUMP_PINS, NUTRIENT_PUMP_PIN_COUNT, open);
+  }
+  else
+  {
+    digitalWrite(pin, level ? HIGH : LOW);
+  }
 
   if (pin == WATER_VALVE_PIN)
   {
@@ -3034,476 +3104,14 @@ void runValveFor(uint8_t pin, uint32_t durationMs, const char *valveName)
   uint32_t startedAt = millis();
   while ((uint32_t)(millis() - startedAt) < durationMs)
   {
+    pollUnoTelemetryLink(false);
+    pollSetupResetButton();
     maintainWiFiConnection();
     serviceNetwork();
     delay(50);
   }
 
   setValve(pin, false);
-}
-
-float readTankDistanceCm()
-{
-  digitalWrite(TANK_LEVEL_TRIG_PIN, LOW);
-  delayMicroseconds(3);
-  digitalWrite(TANK_LEVEL_TRIG_PIN, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(TANK_LEVEL_TRIG_PIN, LOW);
-
-  unsigned long pulseWidthUs = pulseIn(TANK_LEVEL_ECHO_PIN, HIGH, TANK_ULTRASONIC_TIMEOUT_US);
-  if (pulseWidthUs == 0)
-  {
-    return NAN;
-  }
-
-  return ((float)pulseWidthUs * 0.0343f) * 0.5f;
-}
-
-bool isTankLevelLow()
-{
-  uint8_t validSamples = 0;
-  uint8_t lowVotes = 0;
-  float distanceSum = 0.0f;
-
-  for (uint8_t i = 0; i < TANK_LEVEL_SAMPLE_COUNT; i++)
-  {
-    float distanceCm = readTankDistanceCm();
-    if (!isnan(distanceCm) &&
-        distanceCm >= TANK_MIN_VALID_DISTANCE_CM &&
-        distanceCm <= TANK_MAX_VALID_DISTANCE_CM)
-    {
-      validSamples++;
-      distanceSum += distanceCm;
-      if (distanceCm >= TANK_LOW_DISTANCE_CM)
-      {
-        lowVotes++;
-      }
-    }
-    delay(25);
-  }
-
-  if (validSamples == 0)
-  {
-    latestTankDistanceCm = NAN;
-    return TANK_FAILSAFE_LOW_ON_SENSOR_ERROR ? true : latestTankLow;
-  }
-
-  latestTankDistanceCm = distanceSum / (float)validSamples;
-  return lowVotes > (validSamples / 2);
-}
-
-float moisturePercentFromRaw(int raw, int dryRaw, int wetRaw)
-{
-  int span = dryRaw - wetRaw;
-  if (span == 0)
-  {
-    return 0.0f;
-  }
-
-  float pct = (float)(dryRaw - raw) * 100.0f / (float)span;
-  if (pct < 0.0f)
-  {
-    pct = 0.0f;
-  }
-  if (pct > 100.0f)
-  {
-    pct = 100.0f;
-  }
-  return pct;
-}
-
-float readSoilMoisturePercent(uint8_t zoneIndex)
-{
-  if (zoneIndex >= NUM_ZONES)
-  {
-    return 0.0f;
-  }
-
-  const uint8_t pin = MOISTURE_PINS[zoneIndex];
-  long sumRaw = 0;
-  const uint8_t sampleCount = 8;
-
-  for (uint8_t i = 0; i < sampleCount; i++)
-  {
-    sumRaw += analogRead(pin);
-    delay(5);
-  }
-
-  int avgRaw = (int)(sumRaw / sampleCount);
-  return moisturePercentFromRaw(avgRaw, MOISTURE_DRY_RAW[zoneIndex], MOISTURE_WET_RAW[zoneIndex]);
-}
-
-uint16_t modbusCRC16(const uint8_t *data, uint16_t len)
-{
-  uint16_t crc = 0xFFFF;
-  for (uint16_t pos = 0; pos < len; pos++)
-  {
-    crc ^= (uint16_t)data[pos];
-    for (uint8_t i = 0; i < 8; i++)
-    {
-      if (crc & 0x0001)
-      {
-        crc >>= 1;
-        crc ^= 0xA001;
-      }
-      else
-      {
-        crc >>= 1;
-      }
-    }
-  }
-  return crc;
-}
-
-void setRS485DirectionTx(bool txEnable)
-{
-  bool level = txEnable ? RS485_DE_RE_TX_HIGH : !RS485_DE_RE_TX_HIGH;
-  digitalWrite(RS485_DE_RE_PIN, level ? HIGH : LOW);
-}
-
-void flushRS485Input()
-{
-  while (RS485Serial.available())
-  {
-    RS485Serial.read();
-  }
-}
-
-bool readNPKRegisters(uint8_t addr, float &n, float &p, float &k)
-{
-  uint8_t req[8];
-  req[0] = addr;
-  req[1] = 0x03;
-  req[2] = 0x00;
-  req[3] = 0x1E;
-  req[4] = 0x00;
-  req[5] = 0x03;
-  uint16_t crc = modbusCRC16(req, 6);
-  req[6] = (uint8_t)(crc & 0xFF);
-  req[7] = (uint8_t)((crc >> 8) & 0xFF);
-
-  flushRS485Input();
-  setRS485DirectionTx(true);
-  delay(2);
-  RS485Serial.write(req, sizeof(req));
-  RS485Serial.flush();
-  delay(2);
-  setRS485DirectionTx(false);
-
-  uint8_t resp[32];
-  uint8_t len = 0;
-  uint32_t startedAt = millis();
-  while ((uint32_t)(millis() - startedAt) < RS485_RESPONSE_TIMEOUT_MS)
-  {
-    while (RS485Serial.available() && len < sizeof(resp))
-    {
-      resp[len++] = (uint8_t)RS485Serial.read();
-    }
-    if (len >= 11)
-    {
-      break;
-    }
-    delay(1);
-  }
-
-  if (len < 11 || resp[0] != addr || resp[1] != 0x03 || resp[2] != 0x06)
-  {
-    return false;
-  }
-
-  uint16_t crcRx = (uint16_t)resp[9] | ((uint16_t)resp[10] << 8);
-  uint16_t crcCalc = modbusCRC16(resp, 9);
-  if (crcRx != crcCalc)
-  {
-    return false;
-  }
-
-  n = (float)(((uint16_t)resp[3] << 8) | resp[4]);
-  p = (float)(((uint16_t)resp[5] << 8) | resp[6]);
-  k = (float)(((uint16_t)resp[7] << 8) | resp[8]);
-  return true;
-}
-
-NPK readNPK(uint8_t zoneNumber)
-{
-  NPK npk = {0.0f, 0.0f, 0.0f};
-  if (zoneNumber == 0 || zoneNumber > NUM_ZONES)
-  {
-    return npk;
-  }
-
-  uint8_t zoneIndex = zoneNumber - 1;
-  uint8_t sensorAddr = NPK_SENSOR_ADDRS[zoneIndex];
-  if (readNPKRegisters(sensorAddr, npk.n, npk.p, npk.k))
-  {
-    return npk;
-  }
-
-  if (hasLatestReadings[zoneIndex])
-  {
-    return latestReadings[zoneIndex].npk;
-  }
-
-  npk.n = thresholds[zoneIndex].nMin;
-  npk.p = thresholds[zoneIndex].pMin;
-  npk.k = thresholds[zoneIndex].kMin;
-  Serial.printf("{\"type\":\"warning\",\"zone\":%u,\"npkRead\":\"failed\",\"sensorAddr\":%u}\n",
-                zoneNumber,
-                sensorAddr);
-  return npk;
-}
-
-uint8_t computeLineXorCrc(const char *line, size_t length)
-{
-  uint8_t crc = 0;
-  for (size_t i = 0; i < length; i++)
-  {
-    crc ^= (uint8_t)line[i];
-  }
-  return crc;
-}
-
-bool applyUnoTelemetryFrame(
-    uint32_t seq,
-    float moisture1,
-    float moisture2,
-    float tankCm,
-    float n1,
-    float p1,
-    float k1,
-    float n2,
-    float p2,
-    float k2,
-    float temp1,
-    float temp2)
-{
-  if (!isfinite(moisture1) || !isfinite(moisture2) || !isfinite(temp1) || !isfinite(temp2))
-  {
-    return false;
-  }
-
-  ZoneReadings z1 = latestReadings[0];
-  ZoneReadings z2 = latestReadings[1];
-
-  z1.moisturePct = constrain(moisture1, 0.0f, 100.0f);
-  z2.moisturePct = constrain(moisture2, 0.0f, 100.0f);
-  z1.tempC = temp1;
-  z2.tempC = temp2;
-
-  if (!hasLatestReadings[0])
-  {
-    z1.humidityPct = 60.0f;
-  }
-  if (!hasLatestReadings[1])
-  {
-    z2.humidityPct = 60.0f;
-  }
-
-  z1.npk.n = n1;
-  z1.npk.p = p1;
-  z1.npk.k = k1;
-  z2.npk.n = n2;
-  z2.npk.p = p2;
-  z2.npk.k = k2;
-
-  latestReadings[0] = z1;
-  latestReadings[1] = z2;
-  hasLatestReadings[0] = true;
-  hasLatestReadings[1] = true;
-
-  if (!USE_LOCAL_TANK_SENSOR && isfinite(tankCm) && tankCm >= TANK_MIN_VALID_DISTANCE_CM && tankCm <= TANK_MAX_VALID_DISTANCE_CM)
-  {
-    latestTankDistanceCm = tankCm;
-    latestTankLow = tankCm >= TANK_LOW_DISTANCE_CM;
-  }
-  else if (!USE_LOCAL_TANK_SENSOR)
-  {
-    latestTankDistanceCm = NAN;
-    latestTankLow = TANK_FAILSAFE_LOW_ON_SENSOR_ERROR ? true : latestTankLow;
-  }
-
-  uint32_t now = millis();
-  lastTelemetrySampleAtMs = now;
-  lastUnoTelemetryAtMs = now;
-  lastUnoTelemetrySeq = seq;
-  unoTelemetryWarnedStale = false;
-  updateThresholdNotifications();
-  return true;
-}
-
-bool parseUnoTelemetryLine(const char *line)
-{
-  size_t len = strlen(line);
-  if (len < 8)
-  {
-    return false;
-  }
-
-  const char *lastComma = strrchr(line, ',');
-  if (lastComma == nullptr)
-  {
-    return false;
-  }
-
-  uint8_t expectedCrc = (uint8_t)strtoul(lastComma + 1, nullptr, 16);
-  uint8_t actualCrc = computeLineXorCrc(line, (size_t)(lastComma - line));
-  if (expectedCrc != actualCrc)
-  {
-    Serial.printf("{\"type\":\"warning\",\"uno\":\"crc_mismatch\",\"expected\":%u,\"actual\":%u}\n",
-                  (unsigned int)expectedCrc,
-                  (unsigned int)actualCrc);
-    return false;
-  }
-
-  char buffer[UNO_TELEMETRY_LINE_MAX + 1];
-  strncpy(buffer, line, UNO_TELEMETRY_LINE_MAX);
-  buffer[UNO_TELEMETRY_LINE_MAX] = '\0';
-
-  char *ctx = nullptr;
-  char *token = strtok_r(buffer, ",", &ctx);
-  if (token == nullptr || strcmp(token, "T") != 0)
-  {
-    return false;
-  }
-
-  const char *seqTok = strtok_r(nullptr, ",", &ctx);
-  const char *sampleTok = strtok_r(nullptr, ",", &ctx);
-  if (seqTok == nullptr || sampleTok == nullptr)
-  {
-    return false;
-  }
-
-  uint32_t seq = strtoul(seqTok, nullptr, 10);
-  (void)strtoul(sampleTok, nullptr, 10);
-  const char *m1Tok = strtok_r(nullptr, ",", &ctx);
-  const char *m2Tok = strtok_r(nullptr, ",", &ctx);
-  const char *tankTok = strtok_r(nullptr, ",", &ctx);
-  const char *n1Tok = strtok_r(nullptr, ",", &ctx);
-  const char *p1Tok = strtok_r(nullptr, ",", &ctx);
-  const char *k1Tok = strtok_r(nullptr, ",", &ctx);
-  const char *n2Tok = strtok_r(nullptr, ",", &ctx);
-  const char *p2Tok = strtok_r(nullptr, ",", &ctx);
-  const char *k2Tok = strtok_r(nullptr, ",", &ctx);
-  const char *t1Tok = strtok_r(nullptr, ",", &ctx);
-  const char *t2Tok = strtok_r(nullptr, ",", &ctx);
-  if (m1Tok == nullptr || m2Tok == nullptr || tankTok == nullptr ||
-      n1Tok == nullptr || p1Tok == nullptr || k1Tok == nullptr ||
-      n2Tok == nullptr || p2Tok == nullptr || k2Tok == nullptr ||
-      t1Tok == nullptr || t2Tok == nullptr)
-  {
-    return false;
-  }
-
-  // Uno bridge emits telemetry in x10 scaled integers for AVR-safe formatting.
-  float moisture1 = atof(m1Tok) / 10.0f;
-  float moisture2 = atof(m2Tok) / 10.0f;
-  float tankCm = atof(tankTok) / 10.0f;
-  float n1 = atof(n1Tok) / 10.0f;
-  float p1 = atof(p1Tok) / 10.0f;
-  float k1 = atof(k1Tok) / 10.0f;
-  float n2 = atof(n2Tok) / 10.0f;
-  float p2 = atof(p2Tok) / 10.0f;
-  float k2 = atof(k2Tok) / 10.0f;
-  float temp1 = atof(t1Tok) / 10.0f;
-  float temp2 = atof(t2Tok) / 10.0f;
-
-  return applyUnoTelemetryFrame(seq, moisture1, moisture2, tankCm, n1, p1, k1, n2, p2, k2, temp1, temp2);
-}
-
-void serviceUnoTelemetryLink()
-{
-  if (!USE_UNO_TELEMETRY_LINK)
-  {
-    return;
-  }
-
-  static char line[UNO_TELEMETRY_LINE_MAX + 1];
-  static uint16_t lineLen = 0;
-
-  while (RS485Serial.available())
-  {
-    char c = (char)RS485Serial.read();
-    if (c == '\r')
-    {
-      continue;
-    }
-
-    if (c == '\n')
-    {
-      if (lineLen > 0)
-      {
-        line[lineLen] = '\0';
-        parseUnoTelemetryLine(line);
-      }
-      lineLen = 0;
-      continue;
-    }
-
-    if (lineLen >= UNO_TELEMETRY_LINE_MAX)
-    {
-      lineLen = 0;
-      continue;
-    }
-
-    line[lineLen++] = c;
-  }
-}
-
-bool hasFreshUnoTelemetry()
-{
-  if (!USE_UNO_TELEMETRY_LINK || lastUnoTelemetryAtMs == 0)
-  {
-    return false;
-  }
-
-  uint32_t ageMs = (uint32_t)(millis() - lastUnoTelemetryAtMs);
-  if (ageMs <= UNO_TELEMETRY_STALE_WARN_MS)
-  {
-    return true;
-  }
-
-  if (!unoTelemetryWarnedStale)
-  {
-    Serial.printf("{\"type\":\"warning\",\"uno\":\"telemetry_stale\",\"ageMs\":%lu}\n", (unsigned long)ageMs);
-    unoTelemetryWarnedStale = true;
-  }
-
-  return ageMs <= UNO_TELEMETRY_FAILSAFE_MS;
-}
-
-ZoneReadings readZone(uint8_t zoneIndex)
-{
-  ZoneReadings readings;
-  readings.moisturePct = readSoilMoisturePercent(zoneIndex);
-
-  float temp = dhtSensors[zoneIndex]->readTemperature();
-  float humidity = dhtSensors[zoneIndex]->readHumidity();
-
-  if (isnan(temp))
-  {
-    temp = hasLatestReadings[zoneIndex] ? latestReadings[zoneIndex].tempC : 25.0f;
-  }
-  if (isnan(humidity))
-  {
-    humidity = hasLatestReadings[zoneIndex] ? latestReadings[zoneIndex].humidityPct : 60.0f;
-  }
-
-  readings.tempC = temp;
-  readings.humidityPct = humidity;
-  readings.npk = readNPK(zoneIndex + 1);
-
-  if (hasLatestReadings[zoneIndex])
-  {
-    const ZoneReadings &previous = latestReadings[zoneIndex];
-    readings.moisturePct = smoothReading(previous.moisturePct, readings.moisturePct, SENSOR_SMOOTHING_ALPHA);
-    readings.tempC = smoothReading(previous.tempC, readings.tempC, SENSOR_SMOOTHING_ALPHA);
-    readings.humidityPct = smoothReading(previous.humidityPct, readings.humidityPct, SENSOR_SMOOTHING_ALPHA);
-    readings.npk.n = smoothReading(previous.npk.n, readings.npk.n, SENSOR_SMOOTHING_ALPHA);
-    readings.npk.p = smoothReading(previous.npk.p, readings.npk.p, SENSOR_SMOOTHING_ALPHA);
-    readings.npk.k = smoothReading(previous.npk.k, readings.npk.k, SENSOR_SMOOTHING_ALPHA);
-  }
-
-  return readings;
 }
 
 bool haveCompleteTelemetry()
@@ -3518,59 +3126,181 @@ bool haveCompleteTelemetry()
   return true;
 }
 
-void refreshTelemetry(bool emitEvents)
+uint8_t xorFrameCrc(const char *text, size_t len)
 {
-  if (USE_UNO_TELEMETRY_LINK)
+  uint8_t crc = 0;
+  for (size_t i = 0; i < len; i++)
   {
-    serviceUnoTelemetryLink();
-    if (USE_LOCAL_TANK_SENSOR)
+    crc ^= (uint8_t)text[i];
+  }
+  return crc;
+}
+
+bool parseUnoTelemetryFrame(const char *line, ZoneReadings *outReadings, float &outTankDistanceCm)
+{
+  if (line == nullptr || line[0] == '\0')
+  {
+    return false;
+  }
+
+  char copy[192];
+  strncpy(copy, line, sizeof(copy) - 1);
+  copy[sizeof(copy) - 1] = '\0';
+
+  char *lastComma = strrchr(copy, ',');
+  if (lastComma == nullptr || *(lastComma + 1) == '\0')
+  {
+    return false;
+  }
+
+  char *crcToken = lastComma + 1;
+  *lastComma = '\0';
+  uint8_t expectedCrc = (uint8_t)strtoul(crcToken, nullptr, 16);
+  uint8_t actualCrc = xorFrameCrc(copy, strlen(copy));
+  if (expectedCrc != actualCrc)
+  {
+    return false;
+  }
+
+  char *ctx = nullptr;
+  char *typeTok = strtok_r(copy, ",", &ctx);
+  if (typeTok == nullptr || strcmp(typeTok, "T") != 0)
+  {
+    return false;
+  }
+
+  char *seqTok = strtok_r(nullptr, ",", &ctx);
+  char *msTok = strtok_r(nullptr, ",", &ctx);
+  if (seqTok == nullptr || msTok == nullptr)
+  {
+    return false;
+  }
+
+  int32_t values[11] = {0};
+  for (uint8_t i = 0; i < 11; i++)
+  {
+    char *token = strtok_r(nullptr, ",", &ctx);
+    if (token == nullptr)
     {
-      latestTankLow = isTankLevelLow();
+      return false;
     }
-    if (!hasFreshUnoTelemetry())
+    char *end = nullptr;
+    long parsed = strtol(token, &end, 10);
+    if (end == token || *end != '\0')
     {
-      return;
+      return false;
+    }
+    values[i] = (int32_t)parsed;
+  }
+
+  outReadings[0].moisturePct = (float)values[0] / 10.0f;
+  outReadings[1].moisturePct = (float)values[1] / 10.0f;
+  outTankDistanceCm = (values[2] >= 0) ? ((float)values[2] / 10.0f) : NAN;
+
+  outReadings[0].npk.n = (float)values[3] / 10.0f;
+  outReadings[0].npk.p = (float)values[4] / 10.0f;
+  outReadings[0].npk.k = (float)values[5] / 10.0f;
+  outReadings[1].npk.n = (float)values[6] / 10.0f;
+  outReadings[1].npk.p = (float)values[7] / 10.0f;
+  outReadings[1].npk.k = (float)values[8] / 10.0f;
+
+  outReadings[0].tempC = (float)values[9] / 10.0f;
+  outReadings[1].tempC = (float)values[10] / 10.0f;
+
+  outReadings[0].humidityPct = hasLatestReadings[0] ? latestReadings[0].humidityPct : UNO_DEFAULT_HUMIDITY_PCT;
+  outReadings[1].humidityPct = hasLatestReadings[1] ? latestReadings[1].humidityPct : UNO_DEFAULT_HUMIDITY_PCT;
+
+  return true;
+}
+
+void pollUnoTelemetryLink(bool emitEvents)
+{
+  while (RS485Serial.available())
+  {
+    char c = (char)RS485Serial.read();
+    if (c == '\r')
+    {
+      continue;
     }
 
-    if (emitEvents)
+    if (c == '\n')
     {
-      for (uint8_t zone = 0; zone < NUM_ZONES; zone++)
+      if (unoFrameLength == 0)
       {
-        emitReadings(zone, latestReadings[zone]);
+        continue;
       }
+
+      unoFrameBuffer[unoFrameLength] = '\0';
+      ZoneReadings parsedReadings[NUM_ZONES];
+      float parsedTankDistanceCm = NAN;
+      if (parseUnoTelemetryFrame(unoFrameBuffer, parsedReadings, parsedTankDistanceCm))
+      {
+        for (uint8_t zone = 0; zone < NUM_ZONES; zone++)
+        {
+          if (hasLatestReadings[zone])
+          {
+            parsedReadings[zone].moisturePct = smoothReading(latestReadings[zone].moisturePct, parsedReadings[zone].moisturePct, SENSOR_SMOOTHING_ALPHA);
+            parsedReadings[zone].tempC = smoothReading(latestReadings[zone].tempC, parsedReadings[zone].tempC, SENSOR_SMOOTHING_ALPHA);
+            parsedReadings[zone].humidityPct = smoothReading(latestReadings[zone].humidityPct, parsedReadings[zone].humidityPct, SENSOR_SMOOTHING_ALPHA);
+            parsedReadings[zone].npk.n = smoothReading(latestReadings[zone].npk.n, parsedReadings[zone].npk.n, SENSOR_SMOOTHING_ALPHA);
+            parsedReadings[zone].npk.p = smoothReading(latestReadings[zone].npk.p, parsedReadings[zone].npk.p, SENSOR_SMOOTHING_ALPHA);
+            parsedReadings[zone].npk.k = smoothReading(latestReadings[zone].npk.k, parsedReadings[zone].npk.k, SENSOR_SMOOTHING_ALPHA);
+          }
+
+          latestReadings[zone] = parsedReadings[zone];
+          hasLatestReadings[zone] = true;
+          if (emitEvents)
+          {
+            emitReadings(zone, latestReadings[zone]);
+          }
+        }
+
+        latestTankDistanceCm = parsedTankDistanceCm;
+        if (isnan(parsedTankDistanceCm))
+        {
+          latestTankLow = TANK_FAILSAFE_LOW_ON_SENSOR_ERROR ? true : latestTankLow;
+        }
+        else
+        {
+          latestTankLow = parsedTankDistanceCm >= TANK_LOW_DISTANCE_CM;
+        }
+        lastTelemetrySampleAtMs = millis();
+        updateThresholdNotifications();
+      }
+
+      unoFrameLength = 0;
+      continue;
     }
+
+    if (unoFrameLength >= sizeof(unoFrameBuffer) - 1)
+    {
+      unoFrameLength = 0;
+      continue;
+    }
+
+    unoFrameBuffer[unoFrameLength++] = c;
+  }
+}
+
+void refreshTelemetry(bool emitEvents)
+{
+  pollUnoTelemetryLink(emitEvents);
+
+  if (haveCompleteTelemetry())
+  {
     return;
   }
 
-  for (uint8_t zone = 0; zone < NUM_ZONES; zone++)
+  uint32_t startedAt = millis();
+  while (!haveCompleteTelemetry() && (uint32_t)(millis() - startedAt) < UNO_TELEMETRY_WAIT_MS)
   {
-    ZoneReadings readings = readZone(zone);
-    latestReadings[zone] = readings;
-    hasLatestReadings[zone] = true;
-
-    if (emitEvents)
-    {
-      emitReadings(zone, readings);
-    }
+    pollUnoTelemetryLink(emitEvents);
+    delay(5);
   }
-
-  latestTankLow = isTankLevelLow();
-  lastTelemetrySampleAtMs = millis();
-  updateThresholdNotifications();
 }
 
 void refreshTelemetryIfDue()
 {
-  if (USE_UNO_TELEMETRY_LINK)
-  {
-    serviceUnoTelemetryLink();
-    if (USE_LOCAL_TANK_SENSOR)
-    {
-      latestTankLow = isTankLevelLow();
-    }
-    return;
-  }
-
   uint32_t now = millis();
   if (haveCompleteTelemetry() && (uint32_t)(now - lastTelemetrySampleAtMs) < TELEMETRY_REFRESH_INTERVAL_MS)
   {
@@ -3851,10 +3581,10 @@ void renderLCDPage()
   }
   else if (currentLCDPage == 0)
   {
-    snprintf(line1, sizeof(line1), "%s cycle %lu", phaseText, (unsigned long)cycleCount);
-    snprintf(line2, sizeof(line2), "Left %s", remainingText);
-    snprintf(line3, sizeof(line3), "Tank OK");
-    snprintf(line4, sizeof(line4), "IP %s", currentNetworkIp().c_str());
+    snprintf(line1, sizeof(line1), "%s Cycle %lu", phaseText, (unsigned long)cycleCount);
+    snprintf(line2, sizeof(line2), "Time left %s", remainingText);
+    snprintf(line3, sizeof(line3), "%s", latestTankLow ? "Tank low" : "Water tank OK");
+    snprintf(line4, sizeof(line4), "%s", currentNetworkIp().c_str());
   }
   else if (currentLCDPage == 1)
   {
@@ -3881,7 +3611,6 @@ void updateLCD()
   {
     currentLCDPage = (currentLCDPage + 1) % 3;
     lastLCDPageSwitchAt = now;
-    lcdNeedsFullRefresh = true;
   }
   else if (latestTankLow)
   {
@@ -3996,272 +3725,6 @@ bool extractJsonStringField(const String &json, const char *fieldName, String &o
   return false;
 }
 
-bool extractJsonUIntField(const String &json, const char *fieldName, uint32_t &outValue)
-{
-  String needle = String("\"") + fieldName + "\"";
-  int keyStart = json.indexOf(needle);
-  if (keyStart < 0)
-  {
-    return false;
-  }
-
-  int colon = json.indexOf(':', keyStart + needle.length());
-  if (colon < 0)
-  {
-    return false;
-  }
-
-  int i = colon + 1;
-  while (i < (int)json.length())
-  {
-    char c = json[i];
-    if (c == ' ' || c == '\n' || c == '\r' || c == '\t')
-    {
-      i++;
-      continue;
-    }
-    break;
-  }
-
-  if (i >= (int)json.length())
-  {
-    return false;
-  }
-
-  uint64_t value = 0;
-  bool foundDigit = false;
-  while (i < (int)json.length())
-  {
-    char c = json[i];
-    if (c < '0' || c > '9')
-    {
-      break;
-    }
-    foundDigit = true;
-    value = (value * 10ULL) + (uint64_t)(c - '0');
-    if (value > 0xFFFFFFFFULL)
-    {
-      return false;
-    }
-    i++;
-  }
-
-  if (!foundDigit)
-  {
-    return false;
-  }
-
-  outValue = (uint32_t)value;
-  return true;
-}
-
-int8_t manualPumpIndexById(const String &pumpId)
-{
-  for (uint8_t i = 0; i < MANUAL_PUMP_COUNT; i++)
-  {
-    if (pumpId == MANUAL_PUMP_IDS[i])
-    {
-      return (int8_t)i;
-    }
-  }
-  return -1;
-}
-
-bool isManualPumpConfigured(uint8_t pumpIndex)
-{
-  return pumpIndex < MANUAL_PUMP_COUNT && MANUAL_PUMP_PINS[pumpIndex] >= 0;
-}
-
-void setManualPumpOutput(uint8_t pumpIndex, bool enabled)
-{
-  if (!isManualPumpConfigured(pumpIndex))
-  {
-    return;
-  }
-
-  uint8_t pin = (uint8_t)MANUAL_PUMP_PINS[pumpIndex];
-  if (pin == WATER_VALVE_PIN || pin == NUTRIENT_VALVE_PIN)
-  {
-    setValve(pin, enabled);
-    return;
-  }
-
-  bool level = enabled ? VALVE_ACTIVE_HIGH : !VALVE_ACTIVE_HIGH;
-  digitalWrite(pin, level ? HIGH : LOW);
-}
-
-bool anyManualPumpActive()
-{
-  for (uint8_t i = 0; i < MANUAL_PUMP_COUNT; i++)
-  {
-    if (manualPumpActive[i])
-    {
-      return true;
-    }
-  }
-  return false;
-}
-
-void serviceManualPumps()
-{
-  uint32_t now = millis();
-  for (uint8_t i = 0; i < MANUAL_PUMP_COUNT; i++)
-  {
-    if (!manualPumpActive[i])
-    {
-      continue;
-    }
-
-    if ((int32_t)(now - manualPumpEndsAtMs[i]) < 0)
-    {
-      continue;
-    }
-
-    manualPumpActive[i] = false;
-    manualPumpEndsAtMs[i] = 0;
-    setManualPumpOutput(i, false);
-    Serial.printf("{\"type\":\"manual_pump\",\"pumpId\":\"%s\",\"state\":\"stopped\"}\n", MANUAL_PUMP_IDS[i]);
-  }
-}
-
-bool startManualPumpById(const String &pumpId, uint32_t durationMs, String &reason, uint32_t &endsAtMs)
-{
-  int8_t index = manualPumpIndexById(pumpId);
-  if (index < 0)
-  {
-    reason = "invalid_pump";
-    return false;
-  }
-
-  uint8_t pumpIndex = (uint8_t)index;
-  if (!isManualPumpConfigured(pumpIndex))
-  {
-    reason = "not_configured";
-    return false;
-  }
-
-  if (durationMs < MANUAL_PUMP_MIN_DURATION_MS || durationMs > MANUAL_PUMP_MAX_DURATION_MS)
-  {
-    reason = "invalid_duration";
-    return false;
-  }
-
-  if (latestTankLow)
-  {
-    reason = "tank_low";
-    return false;
-  }
-
-  if (waterValveOpen || nutrientValveOpen || anyManualPumpActive())
-  {
-    reason = "busy";
-    return false;
-  }
-
-  uint32_t now = millis();
-  if (manualPumpLastStartedAtMs[pumpIndex] != 0 && (uint32_t)(now - manualPumpLastStartedAtMs[pumpIndex]) < MANUAL_PUMP_COOLDOWN_MS)
-  {
-    reason = "cooldown";
-    return false;
-  }
-
-  if (manualPumpWindowStartedAtMs[pumpIndex] == 0 || (uint32_t)(now - manualPumpWindowStartedAtMs[pumpIndex]) >= MANUAL_PUMP_RATE_WINDOW_MS)
-  {
-    manualPumpWindowStartedAtMs[pumpIndex] = now;
-    manualPumpWindowCount[pumpIndex] = 0;
-  }
-
-  if (manualPumpWindowCount[pumpIndex] >= MANUAL_PUMP_MAX_PER_WINDOW)
-  {
-    reason = "rate_limited";
-    return false;
-  }
-
-  setManualPumpOutput(pumpIndex, true);
-  manualPumpActive[pumpIndex] = true;
-  manualPumpLastStartedAtMs[pumpIndex] = now;
-  manualPumpWindowCount[pumpIndex]++;
-  manualPumpEndsAtMs[pumpIndex] = now + durationMs;
-  endsAtMs = manualPumpEndsAtMs[pumpIndex];
-  reason = "started";
-
-  Serial.printf("{\"type\":\"manual_pump\",\"pumpId\":\"%s\",\"durationMs\":%lu}\n",
-                MANUAL_PUMP_IDS[pumpIndex],
-                (unsigned long)durationMs);
-  return true;
-}
-
-String buildManualPumpStateJSON()
-{
-  uint32_t now = millis();
-  String json;
-  json.reserve(512);
-  json += "{";
-  json += "\"pumps\":[";
-
-  for (uint8_t i = 0; i < MANUAL_PUMP_COUNT; i++)
-  {
-    if (i > 0)
-    {
-      json += ",";
-    }
-
-    uint32_t cooldownRemainingMs = 0;
-    if (manualPumpLastStartedAtMs[i] != 0)
-    {
-      uint32_t elapsed = (uint32_t)(now - manualPumpLastStartedAtMs[i]);
-      if (elapsed < MANUAL_PUMP_COOLDOWN_MS)
-      {
-        cooldownRemainingMs = MANUAL_PUMP_COOLDOWN_MS - elapsed;
-      }
-    }
-
-    uint32_t runningRemainingMs = 0;
-    if (manualPumpActive[i] && (int32_t)(manualPumpEndsAtMs[i] - now) > 0)
-    {
-      runningRemainingMs = manualPumpEndsAtMs[i] - now;
-    }
-
-    json += "{";
-    json += "\"pumpId\":\"";
-    json += MANUAL_PUMP_IDS[i];
-    json += "\",";
-    json += "\"configured\":";
-    json += isManualPumpConfigured(i) ? "true" : "false";
-    json += ",";
-    json += "\"active\":";
-    json += manualPumpActive[i] ? "true" : "false";
-    json += ",";
-    json += "\"runningRemainingMs\":";
-    json += String(runningRemainingMs);
-    json += ",";
-    json += "\"cooldownRemainingMs\":";
-    json += String(cooldownRemainingMs);
-    json += ",";
-    json += "\"windowCount\":";
-    json += String(manualPumpWindowCount[i]);
-    json += "}";
-  }
-
-  json += "],";
-  json += "\"policy\":{";
-  json += "\"defaultDurationMs\":";
-  json += String(MANUAL_PUMP_DEFAULT_DURATION_MS);
-  json += ",\"minDurationMs\":";
-  json += String(MANUAL_PUMP_MIN_DURATION_MS);
-  json += ",\"maxDurationMs\":";
-  json += String(MANUAL_PUMP_MAX_DURATION_MS);
-  json += ",\"cooldownMs\":";
-  json += String(MANUAL_PUMP_COOLDOWN_MS);
-  json += ",\"rateWindowMs\":";
-  json += String(MANUAL_PUMP_RATE_WINDOW_MS);
-  json += ",\"maxPerWindow\":";
-  json += String(MANUAL_PUMP_MAX_PER_WINDOW);
-  json += "}";
-  json += "}";
-  return json;
-}
-
 void sendResponseHeaders()
 {
   apiServer.sendHeader("Access-Control-Allow-Origin", "*");
@@ -4372,18 +3835,6 @@ String buildStatusJSON()
   json += "\"sampleAgeMs\":";
   json += String(sampleAgeMs);
   json += ",";
-  json += "\"telemetrySource\":\"";
-  json += (USE_UNO_TELEMETRY_LINK ? "uno_serial" : "esp32_local");
-  json += "\",";
-  json += "\"unoTelemetryAgeMs\":";
-  json += (lastUnoTelemetryAtMs == 0) ? String(0) : String((uint32_t)(uptimeMs - lastUnoTelemetryAtMs));
-  json += ",";
-  json += "\"unoTelemetrySeq\":";
-  json += String(lastUnoTelemetrySeq);
-  json += ",";
-  json += "\"unoTelemetryFresh\":";
-  json += hasFreshUnoTelemetry() ? "true" : "false";
-  json += ",";
   json += "\"criticalNutrientLockout\":";
   json += lastCycleCriticalNutrientLockout ? "true" : "false";
   json += ",";
@@ -4393,8 +3844,8 @@ String buildStatusJSON()
   json += "\"nutrientValveOpen\":";
   json += nutrientValveOpen ? "true" : "false";
   json += ",";
-  json += "\"manual\":";
-  json += buildManualPumpStateJSON();
+  json += "\"pumpChannelsConfigured\":";
+  json += String(countAssignedPumpPins(WATER_PUMP_PINS, WATER_PUMP_PIN_COUNT) + countAssignedPumpPins(NUTRIENT_PUMP_PINS, NUTRIENT_PUMP_PIN_COUNT));
   json += ",";
   json += "\"lastAlert\":\"";
   json += jsonEscape(lastAlertMessage);
@@ -4489,6 +3940,12 @@ String buildInfoJSON()
   json += "\",";
   json += "\"numZones\":";
   json += String(NUM_ZONES);
+  json += ",";
+  json += "\"pumpChannelsTotal\":";
+  json += String(WATER_PUMP_PIN_COUNT + NUTRIENT_PUMP_PIN_COUNT);
+  json += ",";
+  json += "\"pumpChannelsConfigured\":";
+  json += String(countAssignedPumpPins(WATER_PUMP_PINS, WATER_PUMP_PIN_COUNT) + countAssignedPumpPins(NUTRIENT_PUMP_PINS, NUTRIENT_PUMP_PIN_COUNT));
   json += ",";
   json += "\"telemetryRefreshMs\":";
   json += String(TELEMETRY_REFRESH_INTERVAL_MS);
@@ -4672,58 +4129,6 @@ void handleResetWiFi()
   startProvisioningMode("wifi_reset");
 }
 
-void handleManualPumpState()
-{
-  sendJsonResponse(200, buildManualPumpStateJSON());
-}
-
-void handleManualPumpTrigger()
-{
-  if (provisioningMode)
-  {
-    sendJsonResponse(409, "{\"ok\":false,\"reason\":\"provisioning_mode\"}");
-    return;
-  }
-
-  String body = apiServer.arg("plain");
-  String pumpId;
-  if (!extractJsonStringField(body, "pumpId", pumpId))
-  {
-    sendJsonResponse(400, "{\"ok\":false,\"reason\":\"invalid_payload\"}");
-    return;
-  }
-
-  pumpId.trim();
-  pumpId.toLowerCase();
-
-  uint32_t durationMs = MANUAL_PUMP_DEFAULT_DURATION_MS;
-  uint32_t parsedDuration = 0;
-  if (extractJsonUIntField(body, "durationMs", parsedDuration))
-  {
-    durationMs = parsedDuration;
-  }
-
-  String reason;
-  uint32_t endsAtMs = 0;
-  if (!startManualPumpById(pumpId, durationMs, reason, endsAtMs))
-  {
-    String response = "{\"ok\":false,\"reason\":\"";
-    response += jsonEscape(reason);
-    response += "\"}";
-    sendJsonResponse(409, response);
-    return;
-  }
-
-  String response = "{\"ok\":true,\"state\":\"started\",\"pumpId\":\"";
-  response += jsonEscape(pumpId);
-  response += "\",\"durationMs\":";
-  response += String(durationMs);
-  response += ",\"endsAtMs\":";
-  response += String(endsAtMs);
-  response += "}";
-  sendJsonResponse(202, response);
-}
-
 void setupApiServer()
 {
   if (!apiRoutesRegistered)
@@ -4742,10 +4147,6 @@ void setupApiServer()
     apiServer.on("/api/provisioning/result", HTTP_OPTIONS, handleOptions);
     apiServer.on("/api/device/reset-wifi", HTTP_POST, handleResetWiFi);
     apiServer.on("/api/device/reset-wifi", HTTP_OPTIONS, handleOptions);
-    apiServer.on("/api/manual/state", HTTP_GET, handleManualPumpState);
-    apiServer.on("/api/manual/state", HTTP_OPTIONS, handleOptions);
-    apiServer.on("/api/manual/pump", HTTP_POST, handleManualPumpTrigger);
-    apiServer.on("/api/manual/pump", HTTP_OPTIONS, handleOptions);
     apiServer.on("/healthz", HTTP_GET, handleHealth);
     apiServer.on("/healthz", HTTP_OPTIONS, handleOptions);
     apiServer.onNotFound([]()
@@ -4911,6 +4312,9 @@ String buildStatusJSON()
   json += ",";
   json += "\"nutrientValveOpen\":";
   json += (nutrientValveOpen ? "true" : "false");
+  json += ",";
+  json += "\"pumpChannelsConfigured\":";
+  json += String(countAssignedPumpPins(WATER_PUMP_PINS, WATER_PUMP_PIN_COUNT) + countAssignedPumpPins(NUTRIENT_PUMP_PINS, NUTRIENT_PUMP_PIN_COUNT));
   json += ",";
   json += "\"lastAlert\":\"";
   json += jsonEscape(lastAlertMessage);
@@ -5332,25 +4736,14 @@ void executeControlCycle()
     {
       emitReadings(zone, latestReadings[zone]);
     }
-    if (!USE_UNO_TELEMETRY_LINK || USE_LOCAL_TANK_SENSOR)
-    {
-      latestTankLow = isTankLevelLow();
-    }
   }
 
-  if (!haveCompleteTelemetry())
+  if (!haveCompleteTelemetry() || (uint32_t)(millis() - lastTelemetrySampleAtMs) > UNO_TELEMETRY_STALE_MS)
   {
     closeAllValves();
-    setAlertMessage("Telemetry missing; watering paused.");
-    lastCycleElapsedMs = millis() - cycleStart;
-    lastCycleCompletedAtMs = millis();
-    return;
-  }
-
-  if (USE_UNO_TELEMETRY_LINK && !hasFreshUnoTelemetry())
-  {
-    closeAllValves();
-    setAlertMessage("UNO telemetry stale; watering paused.");
+    setAlertMessage("Sensor bridge telemetry unavailable. Automation paused.");
+    lastWaterPulseMs = 0;
+    lastNutrientPulseMs = 0;
     lastCycleElapsedMs = millis() - cycleStart;
     lastCycleCompletedAtMs = millis();
     return;
@@ -5448,17 +4841,16 @@ void executeControlCycle()
   }
 
   bool previousTankLow = latestTankLow;
-  bool tankLow = (!USE_UNO_TELEMETRY_LINK || USE_LOCAL_TANK_SENSOR) ? isTankLevelLow() : latestTankLow;
-  latestTankLow = tankLow;
+  bool tankLow = latestTankLow;
 
   if (isnan(latestTankDistanceCm))
   {
-    Serial.printf("{\"type\":\"tank\",\"sensor\":\"hc-sr04-3v3\",\"distanceCm\":null,\"low\":%s}\n",
+    Serial.printf("{\"type\":\"tank\",\"sensor\":\"uno-ultrasonic\",\"distanceCm\":null,\"low\":%s}\n",
                   tankLow ? "true" : "false");
   }
   else
   {
-    Serial.printf("{\"type\":\"tank\",\"sensor\":\"hc-sr04-3v3\",\"distanceCm\":%.2f,\"low\":%s}\n",
+    Serial.printf("{\"type\":\"tank\",\"sensor\":\"uno-ultrasonic\",\"distanceCm\":%.2f,\"low\":%s}\n",
                   latestTankDistanceCm, tankLow ? "true" : "false");
   }
 
@@ -5468,11 +4860,12 @@ void executeControlCycle()
     maybeSendTankLowEmail();
   }
 
-  if (tankLow && requestedWaterMs > 0)
+ /* if (tankLow && requestedWaterMs > 0)
   {
     Serial.println("{\"type\":\"safety\",\"event\":\"water_blocked\",\"reason\":\"tank_low\"}");
     requestedWaterMs = 0;
   }
+ */ 
 
   uint32_t elapsed = millis() - cycleStart;
   uint32_t remaining = (elapsed < ACTIVE_DURATION_MS) ? (ACTIVE_DURATION_MS - elapsed) : 0;
@@ -5577,53 +4970,15 @@ void setup()
   Serial.println("[boot] esp32-c3 controller starting");
   WiFi.onEvent(onWiFiEvent);
 
-  pinMode(WATER_VALVE_PIN, OUTPUT);
-  pinMode(NUTRIENT_VALVE_PIN, OUTPUT);
-  for (uint8_t i = 0; i < MANUAL_PUMP_COUNT; i++)
-  {
-    if (!isManualPumpConfigured(i))
-    {
-      continue;
-    }
-
-    uint8_t pin = (uint8_t)MANUAL_PUMP_PINS[i];
-    pinMode(pin, OUTPUT);
-    setManualPumpOutput(i, false);
-  }
-  if (!USE_UNO_TELEMETRY_LINK || USE_LOCAL_TANK_SENSOR)
-  {
-    pinMode(TANK_LEVEL_TRIG_PIN, OUTPUT);
-    pinMode(TANK_LEVEL_ECHO_PIN, INPUT);
-    digitalWrite(TANK_LEVEL_TRIG_PIN, LOW);
-  }
+  setupPumpGroupPins(WATER_PUMP_PINS, WATER_PUMP_PIN_COUNT);
+  setupPumpGroupPins(NUTRIENT_PUMP_PINS, NUTRIENT_PUMP_PIN_COUNT);
+  pinMode(SETUP_RESET_BUTTON_PIN, SETUP_RESET_BUTTON_ACTIVE_LOW ? INPUT_PULLUP : INPUT);
 
   closeAllValves();
 
-  if (!USE_UNO_TELEMETRY_LINK)
-  {
-    dhtZone1.begin();
-    dhtZone2.begin();
-  }
+  RS485Serial.begin(RS485_BAUD, SERIAL_8N1, RS485_RX_PIN, RS485_TX_PIN);
 
-  if (!USE_UNO_TELEMETRY_LINK)
-  {
-    pinMode(RS485_DE_RE_PIN, OUTPUT);
-    setRS485DirectionTx(false);
-  }
-  RS485Serial.begin(USE_UNO_TELEMETRY_LINK ? UNO_LINK_BAUD : RS485_BAUD,
-                    SERIAL_8N1,
-                    RS485_RX_PIN,
-                    RS485_TX_PIN);
-
-  if (!USE_UNO_TELEMETRY_LINK)
-  {
-    for (uint8_t zone = 0; zone < NUM_ZONES; zone++)
-    {
-      analogSetPinAttenuation(MOISTURE_PINS[zone], ADC_11db);
-    }
-  }
-
-  Wire.begin();
+  Wire.begin(LCD_I2C_SDA_PIN, LCD_I2C_SCL_PIN);
   Wire.setClock(100000);
   delay(100);
   lcd.init();
@@ -5633,6 +4988,7 @@ void setup()
   delay(100);
 
   lcdNeedsFullRefresh = true;
+  
   writeLCDLines("Booting...", "ESP32-C3", "Please wait", "");
 
   loadWiFiCredentials();
@@ -5659,6 +5015,8 @@ void setup()
 
 void loop()
 {
+  pollUnoTelemetryLink(false);
+  pollSetupResetButton();
   maintainWiFiConnection();
   notifyWiFiTransition();
 
@@ -5669,7 +5027,6 @@ void loop()
 
   refreshTelemetryIfDue();
   serviceNetwork();
-  serviceManualPumps();
 
   uint32_t now = millis();
 

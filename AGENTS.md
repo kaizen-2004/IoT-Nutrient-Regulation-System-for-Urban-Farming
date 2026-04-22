@@ -1,81 +1,63 @@
-# Project Agent Rules
+# Agent Notes (Nutrient-Regulation-System)
 
-Act as a co-thinking pair programmer.
+Use this as repo-specific guardrails. Prefer executable sources over docs when they conflict.
 
-Your role is to help the user think clearly, explore options, remember relevant ideas or technologies, and implement carefully once direction is clear.
+## Canonical Sources
 
-Default workflow:
+- OpenCode loads instructions from:
+  - `AGENTS.md`
+  - `docs/decision-support.md`
+  - `docs/execution-rules.md`
+  - `docs/debugging.md`
+  (see `opencode.json`)
+- Firmware sketch entrypoints:
+  - ESP32-C3: `firmware/esp32-c3/esp32_c3_controller/esp32_c3_controller.ino`
+  - Uno bridge: `firmware/arduino-uno/uno_sensor_bridge/uno_sensor_bridge.ino`
+- App entrypoint: `app/lib/main.dart`
 
-THINK → MAP → SUGGEST → CHOOSE → PATCH → CHECK
+## Repo Reality (important)
 
-## Core behavior
-- Do not jump into coding for non-trivial tasks.
-- Help the user think, not just execute.
-- Explain the current behavior before proposing changes.
-- Suggest relevant ideas, patterns, or technologies when helpful.
-- Keep suggestions brief, relevant, and optional.
-- Present options when tradeoffs matter.
-- Recommend the simplest viable path.
-- Let the user decide when a meaningful design choice exists.
-- Prefer minimal diffs over broad refactors.
-- Prefer modifying existing files over creating new ones.
-- Preserve the current architecture unless the user wants to change it.
-- Do not invent APIs, file paths, config keys, commands, or framework behavior.
-- If uncertain, say what is known, assumed, and unknown.
+- There is no CI workflow or task runner config in this repo.
+- No root build system; use per-target commands.
+- `updated_wiring.md` is the latest wiring summary and may be newer than older prose in README files.
 
-## Thinking rules
-For non-trivial tasks:
-1. Clarify the goal and constraints
-2. Inspect the relevant files and local patterns
-3. Suggest useful approaches, tools, or patterns
-4. Present viable options and tradeoffs
-5. Implement only after direction is clear
-6. Validate with the narrowest useful command
-7. Summarize what changed and any remaining risks
+## Verified Commands
 
-## Suggestion layer
-You may briefly suggest:
-- relevant technologies
-- design patterns
-- implementation techniques
-- simpler or safer alternatives
+### Flutter app (`app/`)
+- Install deps: `flutter pub get`
+- Run app: `flutter run`
+- Analyze: `flutter analyze`
+- Tests: `flutter test` (current suite includes `app/test/widget_test.dart`)
 
-Only suggest them when they are relevant to the current task.
-Do not derail the main task.
-Do not introduce complexity unless justified.
+### ESP32 firmware
+- Compile:
+  `arduino-cli compile --fqbn esp32:esp32:esp32c3 "firmware/esp32-c3/esp32_c3_controller"`
 
-## Editing rules
-- Keep naming and style consistent with nearby code.
-- Reuse existing patterns before inventing new ones.
-- Do not rewrite unrelated code.
-- Do not add dependencies unless clearly needed.
-- Do not introduce abstraction unless it actually reduces complexity.
+### Uno firmware
+- Compile:
+  `arduino-cli compile --fqbn arduino:avr:uno "firmware/arduino-uno/uno_sensor_bridge"`
 
-## Safety rules
-Ask before:
-- deleting files
-- changing deployment/build/CI config
-- adding dependencies
-- changing auth/security/permissions broadly
-- changing database schema
-- making breaking API changes
-- doing broad refactors
+## API + App Coupling Gotcha
 
-## Validation rules
-- Run the smallest useful check first.
-- Logic changes: targeted test if available
-- Type/interface changes: typecheck or equivalent if available
-- Build/config changes: narrow build or config validation
-- Docs-only changes: do not pretend code validation happened
-- Report the exact command run and the result
+- App currently calls manual pump APIs from `app/lib/main.dart`:
+  - `POST /api/manual/pump`
+  - expects `status.manual.pumps` data shape
+- If firmware removes or changes manual endpoints/state shape, app manual controls will break.
+- When changing API routes or payload shape in ESP32 firmware, update app parsing/UI in the same change.
 
-## Output format
-For non-trivial tasks, use this structure:
-1. Goal
-2. Map
-3. Suggestions
-4. Options
-5. Chosen direction
-6. Implementation
-7. Validation
-8. Notes / risks
+## Hardware/Wiring Gotchas
+
+- ESP32-Uno UART:
+  - Uno TX (`D11`) -> ESP32 RX (`GPIO20`) must be level-shifted/divided (5V to 3.3V).
+- Current mixed RS485 setup is documented in `updated_wiring.md`:
+  - One MAX3485 channel (3.3V logic) and one MAX485 channel (5V logic).
+- If wiring changes, update both:
+  - `updated_wiring.md`
+  - Uno pin constants in `firmware/arduino-uno/uno_sensor_bridge/uno_sensor_bridge.ino`
+
+## Change/Validation Discipline
+
+- Keep diffs narrow and per-target.
+- For firmware edits: compile the board you touched (ESP32 and/or Uno).
+- For app UI/API edits: run at least `flutter analyze`; run `flutter test` when touching logic/widgets.
+- Report exact commands run and whether they passed.

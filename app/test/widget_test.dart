@@ -12,7 +12,7 @@ void main() {
     await tester.pumpWidget(const VertiFarmApp());
     await tester.pumpAndSettle();
 
-    expect(find.text('Add Controller'), findsOneWidget);
+    expect(find.text('Add Device'), findsOneWidget);
     expect(find.text('Scan device QR'), findsOneWidget);
   });
 }

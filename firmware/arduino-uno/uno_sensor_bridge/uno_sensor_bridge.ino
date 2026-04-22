@@ -1,13 +1,7 @@
 #include <Arduino.h>
 #include <SoftwareSerial.h>
-
-#if __has_include(<OneWire.h>) && __has_include(<DallasTemperature.h>)
 #include <DallasTemperature.h>
 #include <OneWire.h>
-#define HAS_DS18B20_LIBS 1
-#else
-#define HAS_DS18B20_LIBS 0
-#endif
 
 const uint32_t USB_BAUD = 115200;
 const uint32_t ESP_LINK_BAUD = 19200;
@@ -23,10 +17,19 @@ const int MOISTURE_WET_RAW = 420;
 
 const uint8_t DS18B20_PIN = 2;
 const float DEFAULT_TEMP_C = 25.0f;
+const bool USE_FIXED_DS18B20_ADDRS = true;
 
+const uint8_t TANK_TRIG_PIN = 12;
+const uint8_t TANK_ECHO_PIN = A2;
+const uint8_t TANK_SAMPLE_COUNT = 5;
+const uint32_t TANK_PULSE_TIMEOUT_US = 30000UL;
+const float TANK_MIN_VALID_CM = 2.0f;
+const float TANK_MAX_VALID_CM = 400.0f;
+
+const uint8_t UNASSIGNED_PIN = 255;
 const uint8_t RS485_1_RX_PIN = 4;
 const uint8_t RS485_1_TX_PIN = 5;
-const uint8_t RS485_1_DE_RE_PIN = 6;
+const uint8_t RS485_1_DE_RE_PIN = UNASSIGNED_PIN;
 const uint8_t RS485_2_RX_PIN = 7;
 const uint8_t RS485_2_TX_PIN = 8;
 const uint8_t RS485_2_DE_RE_PIN = 9;
@@ -42,14 +45,12 @@ SoftwareSerial espLink(ESP_LINK_RX_PIN, ESP_LINK_TX_PIN);
 SoftwareSerial rs485Serial1(RS485_1_RX_PIN, RS485_1_TX_PIN);
 SoftwareSerial rs485Serial2(RS485_2_RX_PIN, RS485_2_TX_PIN);
 
-#if HAS_DS18B20_LIBS
 OneWire oneWire(DS18B20_PIN);
 DallasTemperature ds18b20(&oneWire);
-DeviceAddress dsAddr1 = {0};
-DeviceAddress dsAddr2 = {0};
+DeviceAddress dsAddr1 = {0x28, 0x61, 0x66, 0x36, 0xF3, 0x61, 0x51, 0x54};
+DeviceAddress dsAddr2 = {0x28, 0x21, 0x66, 0x36, 0xF3, 0x47, 0xC9, 0x99};
 bool dsHave1 = false;
 bool dsHave2 = false;
-#endif
 
 uint32_t seqCounter = 0;
 uint32_t lastTelemetryAt = 0;
@@ -84,6 +85,9 @@ uint16_t modbusCrc16(const uint8_t *data, size_t len) {
 }
 
 void rs485SetTx(uint8_t deRePin, bool tx) {
+  if (deRePin == UNASSIGNED_PIN) {
+    return;
+  }
   bool level = tx ? RS485_DE_RE_TX_HIGH : !RS485_DE_RE_TX_HIGH;
   digitalWrite(deRePin, level ? HIGH : LOW);
 }
@@ -101,17 +105,59 @@ float moisturePercentFromRaw(int raw) {
   return ratio * 100.0f;
 }
 
-#if HAS_DS18B20_LIBS
+float readUltrasonicDistanceCm() {
+  digitalWrite(TANK_TRIG_PIN, LOW);
+  delayMicroseconds(3);
+  digitalWrite(TANK_TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TANK_TRIG_PIN, LOW);
+
+  unsigned long pulseUs = pulseIn(TANK_ECHO_PIN, HIGH, TANK_PULSE_TIMEOUT_US);
+  if (pulseUs == 0) {
+    return NAN;
+  }
+
+  return ((float)pulseUs * 0.0343f) * 0.5f;
+}
+
+float readTankDistanceCm() {
+  float sum = 0.0f;
+  uint8_t valid = 0;
+  for (uint8_t i = 0; i < TANK_SAMPLE_COUNT; i++) {
+    float cm = readUltrasonicDistanceCm();
+    if (isfinite(cm) && cm >= TANK_MIN_VALID_CM && cm <= TANK_MAX_VALID_CM) {
+      sum += cm;
+      valid++;
+    }
+    delay(10);
+  }
+
+  if (valid == 0) {
+    return NAN;
+  }
+  return sum / (float)valid;
+}
+
 void initDs18b20() {
   ds18b20.begin();
-  int count = ds18b20.getDeviceCount();
-  if (count > 0) {
-    dsHave1 = ds18b20.getAddress(dsAddr1, 0);
-  }
-  if (count > 1) {
-    dsHave2 = ds18b20.getAddress(dsAddr2, 1);
+  if (USE_FIXED_DS18B20_ADDRS) {
+    dsHave1 = ds18b20.isConnected(dsAddr1);
+    dsHave2 = ds18b20.isConnected(dsAddr2);
+  } else {
+    int count = ds18b20.getDeviceCount();
+    if (count > 0) {
+      dsHave1 = ds18b20.getAddress(dsAddr1, 0);
+    }
+    if (count > 1) {
+      dsHave2 = ds18b20.getAddress(dsAddr2, 1);
+    }
   }
   ds18b20.setWaitForConversion(true);
+
+  Serial.print("[uno] ds18b20 z1=");
+  Serial.println(dsHave1 ? "ok" : "missing");
+  Serial.print("[uno] ds18b20 z2=");
+  Serial.println(dsHave2 ? "ok" : "missing");
 }
 
 void readDs18b20Temps(float &temp1, float &temp2) {
@@ -141,16 +187,6 @@ void readDs18b20Temps(float &temp1, float &temp2) {
     lastTemp2 = temp2;
   }
 }
-#else
-void initDs18b20() {}
-
-void readDs18b20Temps(float &temp1, float &temp2) {
-  (void)temp1;
-  (void)temp2;
-  temp1 = lastTemp1;
-  temp2 = lastTemp2;
-}
-#endif
 
 bool readHoldingRegister(SoftwareSerial &bus, uint8_t deRePin, uint8_t addr, uint16_t reg, uint16_t &out) {
   uint8_t req[8];
@@ -237,7 +273,7 @@ void sendTelemetryFrame() {
   int raw2 = analogRead(MOISTURE_2_PIN);
   float m1 = moisturePercentFromRaw(raw1);
   float m2 = moisturePercentFromRaw(raw2);
-  float tankCm = -1.0f;
+  float tankCm = readTankDistanceCm();
 
   float t1 = lastTemp1;
   float t2 = lastTemp2;
@@ -373,11 +409,18 @@ void setup() {
 
   pinMode(MOISTURE_1_PIN, INPUT);
   pinMode(MOISTURE_2_PIN, INPUT);
+  pinMode(TANK_TRIG_PIN, OUTPUT);
+  pinMode(TANK_ECHO_PIN, INPUT);
+  digitalWrite(TANK_TRIG_PIN, LOW);
 
-  pinMode(RS485_1_DE_RE_PIN, OUTPUT);
-  pinMode(RS485_2_DE_RE_PIN, OUTPUT);
-  rs485SetTx(RS485_1_DE_RE_PIN, false);
-  rs485SetTx(RS485_2_DE_RE_PIN, false);
+  if (RS485_1_DE_RE_PIN != UNASSIGNED_PIN) {
+    pinMode(RS485_1_DE_RE_PIN, OUTPUT);
+    rs485SetTx(RS485_1_DE_RE_PIN, false);
+  }
+  if (RS485_2_DE_RE_PIN != UNASSIGNED_PIN) {
+    pinMode(RS485_2_DE_RE_PIN, OUTPUT);
+    rs485SetTx(RS485_2_DE_RE_PIN, false);
+  }
 
   initDs18b20();
 

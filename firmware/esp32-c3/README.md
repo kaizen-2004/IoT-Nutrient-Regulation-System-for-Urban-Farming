@@ -4,10 +4,11 @@ This firmware now targets a split architecture: **ESP32-C3 controller + Arduino 
 
 ## Features
 
-- 4x pump relay outputs on ESP32-C3 (`z1a`, `z1b`, `z2a`, `z2b`)
+- 6x pump relay outputs on ESP32-C3 (grouped as 4 water + 2 nutrient)
 - 20x4 LCD (I2C) driven by ESP32-C3
 - JSON API for Flutter app monitoring/provisioning/manual control
 - SoftAP setup mode for first-time Wi-Fi onboarding and recovery
+- Hardware reset button fallback (long-press clears Wi-Fi and enters setup AP)
 - Arduino Uno telemetry bridge over UART (CSV + CRC)
 - UNO-side sensing:
   - 2x capacitive soil moisture sensors
@@ -25,19 +26,20 @@ This firmware now targets a split architecture: **ESP32-C3 controller + Arduino 
 
 ## File
 
-- `esp32_c3_controller.ino`
+- Canonical sketch: `esp32_c3_controller/esp32_c3_controller.ino`
 
 ## Default Pin Map (ESP32-C3)
 
-- `GPIO6`: Pump relay `z1a`
-- `GPIO7`: Pump relay `z1b`
-- `GPIO4`: Pump relay `z2a`
-- `GPIO3`: Pump relay `z2b`
-- `GPIO5`: HC-SR04 `TRIG` (tank sensor)
-- `GPIO10`: HC-SR04 `ECHO` (tank sensor)
+- `GPIO6`: Water pump relay 1
+- `GPIO4`: Water pump relay 2
+- `GPIO3`: Water pump relay 3
+- `GPIO5`: Water pump relay 4
+- `GPIO7`: Nutrient pump relay 1
+- `GPIO10`: Nutrient pump relay 2
+- `GPIO1`: Setup reset button (active-low, hold ~4s)
+- `GPIO8`/`GPIO9`: LCD I2C SDA/SCL
 - `GPIO21`: UART TX to Arduino Uno RX (serial telemetry link)
 - `GPIO20`: UART RX from Arduino Uno TX (serial telemetry link)
-- LCD: I2C (`0x27`) via board SDA/SCL
 
 ## Default Pin Map (Arduino Uno Sensor Bridge)
 
@@ -48,6 +50,7 @@ This firmware now targets a split architecture: **ESP32-C3 controller + Arduino 
 - `D2`: DS18B20 one-wire bus
 - `D5`/`D4` + `D6`: SoftwareSerial TX/RX/DE-RE for MAX485 #1
 - `D8`/`D7` + `D9`: SoftwareSerial TX/RX/DE-RE for MAX485 #2
+- `D12`/`A2`: HC-SR04 ultrasonic TRIG/ECHO
 
 Adjust pins as needed for your exact board.
 
@@ -61,19 +64,22 @@ Adjust pins as needed for your exact board.
 
 | ESP32-C3 output | Connects to |
 |---|---|
-| `GPIO6` | Relay IN for Pump `z1a` |
-| `GPIO7` | Relay IN for Pump `z1b` |
-| `GPIO4` | Relay IN for Pump `z2a` |
-| `GPIO3` | Relay IN for Pump `z2b` |
-| `GPIO5` | HC-SR04 `TRIG` |
-| `GPIO10` | HC-SR04 `ECHO` (direct if 3.3V module; level shift if 5V ECHO) |
-| I2C `SDA/SCL` | 20x4 LCD backpack (`0x27`) |
+| `GPIO6` | Relay IN for water pump #1 |
+| `GPIO4` | Relay IN for water pump #2 |
+| `GPIO3` | Relay IN for water pump #3 |
+| `GPIO5` | Relay IN for water pump #4 |
+| `GPIO7` | Relay IN for nutrient pump #1 |
+| `GPIO10` | Relay IN for nutrient pump #2 |
+| `GPIO1` | Setup reset button (to GND for hold action) |
+| `GPIO8` / `GPIO9` | LCD I2C SDA / SCL (`0x27`) |
 
 | Uno sensor input | Connects to |
 |---|---|
 | `A0` | Capacitive moisture zone 1 analog out |
 | `A1` | Capacitive moisture zone 2 analog out |
 | `D2` | DS18B20 one-wire data (with pull-up) |
+| `D12` | HC-SR04 TRIG |
+| `A2` | HC-SR04 ECHO |
 
 | Uno RS485 channel | Connects to |
 |---|---|
@@ -88,6 +94,14 @@ Adjust pins as needed for your exact board.
   - RS485 module GND
   - Relay logic GND
   - Tank sensor GND
+
+### Hardware Setup Reset Button
+
+- ESP32 `GPIO1` is configured with `INPUT_PULLUP`.
+- Press-and-hold the button (to GND) for about 4 seconds to:
+  - clear saved Wi-Fi credentials
+  - force setup AP mode
+- Firmware provisioning reason is `hardware_button_long_press`.
 
 ## Bring-Up Strategy (Recommended)
 
@@ -157,7 +171,7 @@ Use staged bring-up:
 
 ## Wi-Fi and Email Setup
 
-Edit constants at top of `esp32_c3_controller.ino`:
+Edit constants at top of `esp32_c3_controller/esp32_c3_controller.ino`:
 
 - `ENABLE_LOCAL_API_SERVER` (preprocessor define at top of sketch)
 - `TELEMETRY_REFRESH_INTERVAL_MS`
@@ -188,7 +202,7 @@ Built-in with ESP32 core:
 
 ## Upload
 
-1. Open `esp32_c3_controller.ino` in Arduino IDE.
+1. Open `esp32_c3_controller/esp32_c3_controller.ino` in Arduino IDE.
 2. Install board support: **esp32 by Espressif Systems**.
 3. Select ESP32-C3 board and COM port.
 4. Install required libraries.

@@ -143,6 +143,231 @@ class NotificationService {
   }
 }
 
+enum AppThemePreference { system, light, dark }
+
+enum ConnectionHealth { online, recovering, offline }
+
+class AppThemeStore {
+  static const _themeKey = 'app_theme_preference_v1';
+
+  static Future<AppThemePreference> load() async {
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getString(_themeKey);
+    switch (raw) {
+      case 'light':
+        return AppThemePreference.light;
+      case 'dark':
+        return AppThemePreference.dark;
+      default:
+        return AppThemePreference.system;
+    }
+  }
+
+  static Future<void> save(AppThemePreference preference) async {
+    final prefs = await SharedPreferences.getInstance();
+    final value = switch (preference) {
+      AppThemePreference.light => 'light',
+      AppThemePreference.dark => 'dark',
+      AppThemePreference.system => 'system',
+    };
+    await prefs.setString(_themeKey, value);
+  }
+}
+
+class ManualStep {
+  const ManualStep({
+    required this.id,
+    required this.title,
+    required this.goal,
+    required this.actions,
+    required this.expected,
+    required this.troubleshooting,
+  });
+
+  final String id;
+  final String title;
+  final String goal;
+  final List<String> actions;
+  final String expected;
+  final String troubleshooting;
+}
+
+List<ManualStep> manualGuideSteps() => const [
+  ManualStep(
+    id: 'power_on',
+    title: 'Power on device',
+    goal: 'Make sure the device is ready before setup.',
+    actions: [
+      'Plug in the device and wait for the screen to turn on.',
+      'Check that the screen shows setup or status details.',
+    ],
+    expected: 'The device screen is on and readable.',
+    troubleshooting: 'If the screen is blank, check power cables and adapter.',
+  ),
+  ManualStep(
+    id: 'scan_qr',
+    title: 'Scan the QR code',
+    goal: 'Open setup details automatically.',
+    actions: [
+      'Tap Scan device QR in the app.',
+      'Point your camera at the sticker on the device.',
+    ],
+    expected: 'You see the device details and can continue setup.',
+    troubleshooting: 'If scan fails, use Paste QR payload manually.',
+  ),
+  ManualStep(
+    id: 'join_setup_wifi',
+    title: 'Join device setup Wi-Fi',
+    goal: 'Connect your phone to the device temporary Wi-Fi.',
+    actions: [
+      'Open phone Wi-Fi settings.',
+      'Connect to the setup Wi-Fi shown in app/device screen.',
+    ],
+    expected: 'Check setup Wi-Fi button becomes successful.',
+    troubleshooting: 'If unavailable, restart device and refresh Wi-Fi list.',
+  ),
+  ManualStep(
+    id: 'send_home_wifi',
+    title: 'Connect to home Wi-Fi',
+    goal: 'Move the device from setup Wi-Fi to your home network.',
+    actions: [
+      'Enter your home Wi-Fi name and password.',
+      'Tap Connect device to home Wi-Fi.',
+    ],
+    expected: 'Device appears in dashboard and starts sending readings.',
+    troubleshooting: 'If it fails, verify 2.4 GHz Wi-Fi and password.',
+  ),
+  ManualStep(
+    id: 'daily_use',
+    title: 'Daily use dashboard',
+    goal: 'Read device health quickly.',
+    actions: [
+      'Use Overview for quick status and tank level.',
+      'Use Zones tab for soil moisture, temperature, and NPK details.',
+    ],
+    expected: 'Readings update every few seconds.',
+    troubleshooting: 'If readings stop, check device power and Wi-Fi.',
+  ),
+  ManualStep(
+    id: 'manual_pumps',
+    title: 'Manual watering',
+    goal: 'Run a short pump pulse when needed.',
+    actions: [
+      'Open manual control cards.',
+      'Tap Run pulse on the needed pump.',
+    ],
+    expected: 'Pump starts briefly and then auto-stops.',
+    troubleshooting: 'If blocked, check tank level, cooldown, or active cycle.',
+  ),
+];
+
+class ManualGuideStore {
+  static const _promptPrefix = 'manual_prompt_seen_';
+  static const _stepPrefix = 'manual_current_step_';
+  static const _donePrefix = 'manual_done_steps_';
+
+  static Future<int> loadCurrentStep(String deviceId) async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getInt('$_stepPrefix$deviceId') ?? 0;
+  }
+
+  static Future<Set<String>> loadDoneSteps(String deviceId) async {
+    final prefs = await SharedPreferences.getInstance();
+    return (prefs.getStringList('$_donePrefix$deviceId') ?? const <String>[])
+        .toSet();
+  }
+
+  static Future<void> saveProgress({
+    required String deviceId,
+    required int currentStep,
+    required Set<String> doneSteps,
+  }) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setInt('$_stepPrefix$deviceId', currentStep);
+    await prefs.setStringList('$_donePrefix$deviceId', doneSteps.toList());
+  }
+
+  static Future<bool> loadPromptSeen(String deviceId) async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool('$_promptPrefix$deviceId') ?? false;
+  }
+
+  static Future<void> markPromptSeen(String deviceId) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool('$_promptPrefix$deviceId', true);
+  }
+
+  static Future<void> reset(String deviceId) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove('$_stepPrefix$deviceId');
+    await prefs.remove('$_donePrefix$deviceId');
+  }
+}
+
+String friendlyApiMessage(String raw) {
+  switch (raw) {
+    case 'tank_low':
+      return 'Water tank is low. Please refill before watering.';
+    case 'cooldown':
+      return 'Please wait a bit before using this pump again.';
+    case 'busy':
+      return 'Device is busy with another action. Please try again.';
+    case 'rate_limited':
+      return 'Too many actions in a short time. Please wait and try again.';
+    case 'invalid_duration':
+      return 'Selected run time is not allowed.';
+    case 'not_configured':
+      return 'This pump is not connected yet.';
+    case 'provisioning_mode':
+      return 'Device is in setup mode. Finish setup first.';
+    case 'invalid_payload':
+      return 'The request format is invalid.';
+    case 'invalid_wifi_credentials':
+      return 'Wi-Fi name or password is incorrect.';
+    default:
+      return raw;
+  }
+}
+
+Future<AppThemePreference?> showThemePicker(
+  BuildContext context,
+  AppThemePreference current,
+) {
+  return showModalBottomSheet<AppThemePreference>(
+    context: context,
+    builder: (context) {
+      return SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              title: const Text('Use phone setting'),
+              trailing: current == AppThemePreference.system
+                  ? const Icon(Icons.check)
+                  : null,
+              onTap: () => Navigator.pop(context, AppThemePreference.system),
+            ),
+            ListTile(
+              title: const Text('Light mode'),
+              trailing: current == AppThemePreference.light
+                  ? const Icon(Icons.check)
+                  : null,
+              onTap: () => Navigator.pop(context, AppThemePreference.light),
+            ),
+            ListTile(
+              title: const Text('Dark mode'),
+              trailing: current == AppThemePreference.dark
+                  ? const Icon(Icons.check)
+                  : null,
+              onTap: () => Navigator.pop(context, AppThemePreference.dark),
+            ),
+          ],
+        ),
+      );
+    },
+  );
+}
+
 class VertiFarmApp extends StatefulWidget {
   const VertiFarmApp({super.key});
 
@@ -153,22 +378,50 @@ class VertiFarmApp extends StatefulWidget {
 class _VertiFarmAppState extends State<VertiFarmApp> {
   DeviceRecord? _device;
   bool _loading = true;
+  AppThemePreference _themePreference = AppThemePreference.system;
 
   @override
   void initState() {
     super.initState();
-    _loadDevice();
+    _loadAppState();
   }
 
-  Future<void> _loadDevice() async {
-    final device = await DeviceStore.load();
+  Future<void> _loadAppState() async {
+    final results = await Future.wait<dynamic>([
+      DeviceStore.load(),
+      AppThemeStore.load(),
+    ]);
+    final device = results[0] as DeviceRecord?;
+    final themePreference = results[1] as AppThemePreference;
     if (!mounted) {
       return;
     }
 
     setState(() {
       _device = device;
+      _themePreference = themePreference;
       _loading = false;
+    });
+  }
+
+  ThemeMode get _themeMode {
+    switch (_themePreference) {
+      case AppThemePreference.light:
+        return ThemeMode.light;
+      case AppThemePreference.dark:
+        return ThemeMode.dark;
+      case AppThemePreference.system:
+        return ThemeMode.system;
+    }
+  }
+
+  Future<void> _setThemePreference(AppThemePreference next) async {
+    await AppThemeStore.save(next);
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _themePreference = next;
     });
   }
 
@@ -204,17 +457,42 @@ class _VertiFarmAppState extends State<VertiFarmApp> {
           seedColor: const Color(0xFF2B7A4B),
           brightness: Brightness.light,
         ),
-        scaffoldBackgroundColor: const Color(0xFFF4F7F1),
+        scaffoldBackgroundColor: const Color(0xFFF3F6F2),
+        cardTheme: const CardThemeData(
+          elevation: 0,
+          margin: EdgeInsets.zero,
+        ),
+        appBarTheme: const AppBarTheme(backgroundColor: Color(0xFFF3F6F2)),
         useMaterial3: true,
       ),
+      darkTheme: ThemeData(
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: const Color(0xFF63B37E),
+          brightness: Brightness.dark,
+        ),
+        scaffoldBackgroundColor: const Color(0xFF111915),
+        cardTheme: const CardThemeData(
+          elevation: 0,
+          margin: EdgeInsets.zero,
+        ),
+        appBarTheme: const AppBarTheme(backgroundColor: Color(0xFF111915)),
+        useMaterial3: true,
+      ),
+      themeMode: _themeMode,
       home: _loading
           ? const SplashScreen()
           : (_device == null
-                ? OnboardingScreen(onDeviceProvisioned: _saveDevice)
+                ? OnboardingScreen(
+                    onDeviceProvisioned: _saveDevice,
+                    themePreference: _themePreference,
+                    onThemeChanged: _setThemePreference,
+                  )
                 : DashboardScreen(
                     device: _device!,
                     onDeviceUpdated: _saveDevice,
                     onForgetDevice: _clearDevice,
+                    themePreference: _themePreference,
+                    onThemeChanged: _setThemePreference,
                   )),
     );
   }
@@ -546,9 +824,16 @@ Future<String?> _probeDeviceIp({
 }
 
 class OnboardingScreen extends StatefulWidget {
-  const OnboardingScreen({super.key, required this.onDeviceProvisioned});
+  const OnboardingScreen({
+    super.key,
+    required this.onDeviceProvisioned,
+    required this.themePreference,
+    required this.onThemeChanged,
+  });
 
   final Future<void> Function(DeviceRecord device) onDeviceProvisioned;
+  final AppThemePreference themePreference;
+  final Future<void> Function(AppThemePreference preference) onThemeChanged;
 
   @override
   State<OnboardingScreen> createState() => _OnboardingScreenState();
@@ -628,7 +913,13 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
     }
 
     final device = await Navigator.of(context).push<DeviceRecord>(
-      MaterialPageRoute(builder: (_) => ProvisioningScreen(payload: payload)),
+      MaterialPageRoute(
+        builder: (_) => ProvisioningScreen(
+          payload: payload,
+          themePreference: widget.themePreference,
+          onThemeChanged: widget.onThemeChanged,
+        ),
+      ),
     );
 
     if (device == null) {
@@ -641,7 +932,24 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('Add Controller')),
+      appBar: AppBar(
+        title: const Text('Add Device'),
+        actions: [
+          IconButton(
+            tooltip: 'Theme',
+            onPressed: () async {
+              final picked = await showThemePicker(
+                context,
+                widget.themePreference,
+              );
+              if (picked != null) {
+                await widget.onThemeChanged(picked);
+              }
+            },
+            icon: const Icon(Icons.palette_outlined),
+          ),
+        ],
+      ),
       body: ListView(
         padding: const EdgeInsets.all(20),
         children: [
@@ -692,10 +1000,10 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text(
-                    'Start onboarding',
-                    style: Theme.of(context).textTheme.titleMedium,
-                  ),
+                    Text(
+                      'Start setup',
+                      style: Theme.of(context).textTheme.titleMedium,
+                    ),
                   const SizedBox(height: 12),
                   FilledButton.icon(
                     onPressed: _openScanner,
@@ -707,6 +1015,20 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
                     onPressed: _pastePayload,
                     icon: const Icon(Icons.content_paste),
                     label: const Text('Paste QR payload manually'),
+                  ),
+                  const SizedBox(height: 8),
+                  TextButton.icon(
+                    onPressed: () {
+                      Navigator.of(context).push(
+                        MaterialPageRoute(
+                          builder: (_) => ManualGuideScreen(
+                            deviceId: _payload?.deviceId ?? 'onboarding',
+                          ),
+                        ),
+                      );
+                    },
+                    icon: const Icon(Icons.menu_book_outlined),
+                    label: const Text('Open quick guide'),
                   ),
                   if (_error != null) ...[
                     const SizedBox(height: 8),
@@ -728,7 +1050,7 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   const _SectionHeader(
-                    title: 'Controller found',
+                    title: 'Device found',
                     subtitle:
                         'The QR code looks valid. Continue to the Wi-Fi handoff step.',
                   ),
@@ -752,9 +1074,16 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
 }
 
 class ProvisioningScreen extends StatefulWidget {
-  const ProvisioningScreen({super.key, required this.payload});
+  const ProvisioningScreen({
+    super.key,
+    required this.payload,
+    required this.themePreference,
+    required this.onThemeChanged,
+  });
 
   final QrPayload payload;
+  final AppThemePreference themePreference;
+  final Future<void> Function(AppThemePreference preference) onThemeChanged;
 
   @override
   State<ProvisioningScreen> createState() => _ProvisioningScreenState();
@@ -984,7 +1313,9 @@ class _ProvisioningScreenState extends State<ProvisioningScreen> {
         );
       }
       if (state == 'failed') {
-        throw ApiException((result['reason'] ?? 'Connection failed') as String);
+        throw ApiException(
+          friendlyApiMessage((result['reason'] ?? 'Connection failed') as String),
+        );
       }
     }
 
@@ -1093,7 +1424,24 @@ class _ProvisioningScreenState extends State<ProvisioningScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('Wi-Fi Setup')),
+      appBar: AppBar(
+        title: const Text('Wi-Fi setup'),
+        actions: [
+          IconButton(
+            tooltip: 'Theme',
+            onPressed: () async {
+              final picked = await showThemePicker(
+                context,
+                widget.themePreference,
+              );
+              if (picked != null) {
+                await widget.onThemeChanged(picked);
+              }
+            },
+            icon: const Icon(Icons.palette_outlined),
+          ),
+        ],
+      ),
       body: ListView(
         padding: const EdgeInsets.all(20),
         children: [
@@ -1225,11 +1573,15 @@ class DashboardScreen extends StatefulWidget {
     required this.device,
     required this.onDeviceUpdated,
     required this.onForgetDevice,
+    required this.themePreference,
+    required this.onThemeChanged,
   });
 
   final DeviceRecord device;
   final Future<void> Function(DeviceRecord device) onDeviceUpdated;
   final Future<void> Function() onForgetDevice;
+  final AppThemePreference themePreference;
+  final Future<void> Function(AppThemePreference preference) onThemeChanged;
 
   @override
   State<DashboardScreen> createState() => _DashboardScreenState();
@@ -1252,6 +1604,8 @@ class _DashboardScreenState extends State<DashboardScreen>
   bool _discoveringDevice = false;
   DateTime? _lastDiscoveryAttemptAt;
   final Set<String> _manualPendingPumpIds = <String>{};
+  int _manualCurrentStep = 0;
+  Set<String> _manualDoneSteps = <String>{};
 
   String get _host => widget.device.lastKnownIp;
 
@@ -1259,10 +1613,80 @@ class _DashboardScreenState extends State<DashboardScreen>
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    unawaited(_loadManualProgress());
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      unawaited(_maybePromptGuide());
+    });
     _refresh();
     _pollTimer = Timer.periodic(const Duration(seconds: 3), (_) {
       _refresh(silent: true);
     });
+  }
+
+  Future<void> _loadManualProgress() async {
+    final current = await ManualGuideStore.loadCurrentStep(widget.device.deviceId);
+    final done = await ManualGuideStore.loadDoneSteps(widget.device.deviceId);
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _manualCurrentStep = current;
+      _manualDoneSteps = done;
+    });
+  }
+
+  Future<void> _openGuide({bool reset = false}) async {
+    if (reset) {
+      await ManualGuideStore.reset(widget.device.deviceId);
+      if (mounted) {
+        setState(() {
+          _manualCurrentStep = 0;
+          _manualDoneSteps = <String>{};
+        });
+      }
+    }
+
+    if (!mounted) {
+      return;
+    }
+    await Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => ManualGuideScreen(deviceId: widget.device.deviceId),
+      ),
+    );
+    await _loadManualProgress();
+  }
+
+  Future<void> _maybePromptGuide() async {
+    final seen = await ManualGuideStore.loadPromptSeen(widget.device.deviceId);
+    if (seen || !mounted) {
+      return;
+    }
+
+    final start = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Need a quick tour?'),
+        content: const Text(
+          'We can guide you through setup, readings, and manual watering in a few short steps.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('Maybe later'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            child: const Text('Start guide'),
+          ),
+        ],
+      ),
+    );
+
+    await ManualGuideStore.markPromptSeen(widget.device.deviceId);
+    if (start == true) {
+      await _openGuide();
+    }
   }
 
   @override
@@ -1434,7 +1858,6 @@ class _DashboardScreenState extends State<DashboardScreen>
       history.addSample(
         moisture: _asDouble(entry['soilMoisturePct']),
         temperature: _asDouble(entry['tempC']),
-        humidity: _asDouble(entry['humidityPct']),
         nutrient: _asDouble(entry['nutrientPpm']),
       );
     }
@@ -1474,7 +1897,11 @@ class _DashboardScreenState extends State<DashboardScreen>
       }
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text(error.toString().replaceFirst('Exception: ', '')),
+          content: Text(
+            friendlyApiMessage(
+              error.toString().replaceFirst('Exception: ', ''),
+            ),
+          ),
         ),
       );
     }
@@ -1517,7 +1944,11 @@ class _DashboardScreenState extends State<DashboardScreen>
       }
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text(error.toString().replaceFirst('Exception: ', '')),
+          content: Text(
+            friendlyApiMessage(
+              error.toString().replaceFirst('Exception: ', ''),
+            ),
+          ),
         ),
       );
     } finally {
@@ -1538,21 +1969,49 @@ class _DashboardScreenState extends State<DashboardScreen>
     final hasConnectionError = _error != null;
     final isOnline =
         !hasConnectionError && (wifi['connected'] ?? false) == true;
+    final connectionHealth = isOnline
+        ? ConnectionHealth.online
+        : (_discoveringDevice
+              ? ConnectionHealth.recovering
+              : ConnectionHealth.offline);
 
     return DefaultTabController(
-      length: 3,
+      length: 4,
       child: Scaffold(
         appBar: AppBar(
           title: Text(widget.device.deviceName),
-          backgroundColor: const Color(0xFFF4F7F1),
-          bottom: const TabBar(
-            tabs: [
-              Tab(text: 'Overview'),
-              Tab(text: 'Zones'),
-              Tab(text: 'Device'),
+          bottom: TabBar(
+            isScrollable: false,
+            labelStyle: const TextStyle(
+              fontSize: 13,
+              fontWeight: FontWeight.w700,
+            ),
+            unselectedLabelStyle: const TextStyle(
+              fontSize: 13,
+              fontWeight: FontWeight.w500,
+            ),
+            tabs: const [
+              Tab(child: FittedBox(fit: BoxFit.scaleDown, child: Text('Overview'))),
+              Tab(child: FittedBox(fit: BoxFit.scaleDown, child: Text('Zones'))),
+              Tab(child: FittedBox(fit: BoxFit.scaleDown, child: Text('Device'))),
+              Tab(child: FittedBox(fit: BoxFit.scaleDown, child: Text('Help'))),
             ],
           ),
+
           actions: [
+            IconButton(
+              tooltip: 'Theme',
+              onPressed: () async {
+                final picked = await showThemePicker(
+                  context,
+                  widget.themePreference,
+                );
+                if (picked != null) {
+                  await widget.onThemeChanged(picked);
+                }
+              },
+              icon: const Icon(Icons.palette_outlined),
+            ),
             IconButton(
               onPressed: _busy ? null : _refresh,
               icon: const Icon(Icons.refresh),
@@ -1561,24 +2020,16 @@ class _DashboardScreenState extends State<DashboardScreen>
         ),
         body: Column(
           children: [
-            Material(
-              color: isOnline
-                  ? const Color(0xFFDDEFE3)
-                  : const Color(0xFFF6DFDF),
-              child: ListTile(
-                leading: Icon(isOnline ? Icons.check_circle : Icons.wifi_off),
-                title: Text(
-                  isOnline ? 'Controller online' : 'Controller offline',
-                ),
-                subtitle: Text(
+            _ConnectionStatusStrip(
+              health: connectionHealth,
+              message:
                   _error ??
-                      (isOnline
-                          ? 'Refreshing every 3 seconds'
-                          : (_discoveringDevice
-                                ? 'Trying to rediscover the controller on your local network...'
-                                : 'Reconnect your phone to the same Wi-Fi as the controller, then refresh.')),
-                ),
-              ),
+                  (isOnline
+                      ? 'Latest readings refresh every few seconds.'
+                      : (_discoveringDevice
+                            ? 'Trying to find your device on the local network...'
+                            : 'Your device is offline. Check power and Wi-Fi connection.')),
+              onRetry: _busy ? null : _refresh,
             ),
             Expanded(
               child: TabBarView(
@@ -1590,17 +2041,24 @@ class _DashboardScreenState extends State<DashboardScreen>
                     manualPendingPumpIds: _manualPendingPumpIds,
                   ),
                   _ZonesTab(zones: zones, histories: _zoneHistory),
-                  _DeviceTab(
-                    device: widget.device,
-                    info: _info,
-                    status: status,
-                    onResetWifi: _resetWifi,
-                    onManualPumpTrigger: _triggerManualPump,
-                    manualPendingPumpIds: _manualPendingPumpIds,
-                  ),
-                ],
+                    _DeviceTab(
+                      device: widget.device,
+                      info: _info,
+                      status: status,
+                      onResetWifi: _resetWifi,
+                      onManualPumpTrigger: _triggerManualPump,
+                      manualPendingPumpIds: _manualPendingPumpIds,
+                    ),
+                    _HelpTab(
+                      deviceId: widget.device.deviceId,
+                      currentStep: _manualCurrentStep,
+                      doneSteps: _manualDoneSteps,
+                      onContinueGuide: () => _openGuide(),
+                      onRestartGuide: () => _openGuide(reset: true),
+                    ),
+                  ],
+                ),
               ),
-            ),
           ],
         ),
       ),
@@ -1631,6 +2089,7 @@ class _OverviewTab extends StatelessWidget {
     final cycle = '${data['cycle'] ?? '--'}';
     final connected = (wifi['connected'] ?? false) == true;
     final avgMoisture = _averageZoneValue(zones, 'soilMoisturePct');
+    final avgTemp = _averageZoneValue(zones, 'tempC');
     final avgNutrient = _averageZoneValue(zones, 'nutrientPpm');
     final phaseProgress = _phaseProgress(data);
     final tankDistance = _asDouble(data['tankDistanceCm']);
@@ -1696,7 +2155,7 @@ class _OverviewTab extends StatelessWidget {
               ),
               const SizedBox(height: 8),
               Text(
-                'VertiFarm automated monitoring and nutrient control system',
+                'Track watering, nutrients, and tank status in one place.',
                 style: const TextStyle(color: Color(0xFFD9ECE2), height: 1.35),
               ),
               const SizedBox(height: 20),
@@ -1705,6 +2164,7 @@ class _OverviewTab extends StatelessWidget {
                 value: phaseProgress,
                 accentColor: const Color(0xFF67D39B),
                 valueText: '${(phaseProgress * 100).round()}%',
+                lightOnDark: true,
               ),
             ],
           ),
@@ -1722,41 +2182,44 @@ class _OverviewTab extends StatelessWidget {
               Row(
                 children: [
                   Expanded(
-                    child: _SpotlightCard(
-                      title: 'Avg Soil Wetness',
-                      value: avgMoisture == null
+                    child: _MetricGauge(
+                      label: 'Soil moisture',
+                      value: avgMoisture,
+                      display: avgMoisture == null
                           ? '--'
-                          : '${avgMoisture.round()}%',
-                      subtitle: avgMoisture == null
-                          ? 'Waiting'
-                          : _moistureBandLabel(avgMoisture),
-                      progress: avgMoisture == null
-                          ? 0
-                          : (avgMoisture / 100).clamp(0, 1).toDouble(),
-                      accentColor: const Color(0xFF2F8F62),
+                          : '${avgMoisture.toStringAsFixed(1)} %',
+                      progress: ((avgMoisture ?? 0) / 100).clamp(0, 1),
+                      color: const Color(0xFF2F8F62),
                     ),
                   ),
-                  const SizedBox(width: 8),
+                  const SizedBox(width: 12),
                   Expanded(
-                    child: _SummaryStatCard(
-                      title: 'Plant Food',
-                      value: avgNutrient == null
+                    child: _MetricGauge(
+                      label: 'Temperature',
+                      value: avgTemp,
+                      display: avgTemp == null
                           ? '--'
-                          : '${avgNutrient.round()} ppm',
-                      subtitle: avgNutrient == null
-                          ? 'No sample'
-                          : _nutrientBandLabel(avgNutrient),
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: _SummaryStatCard(
-                      title: 'Time Left',
-                      value: _phaseRemainingText(data),
-                      subtitle: 'Current phase',
+                          : '${avgTemp.toStringAsFixed(1)} C',
+                      progress: ((avgTemp ?? 0) / 50).clamp(0, 1),
+                      color: const Color(0xFFF97316),
                     ),
                   ),
                 ],
+              ),
+              const SizedBox(height: 12),
+              _MetricGauge(
+                label: 'Plant food',
+                value: avgNutrient,
+                display: avgNutrient == null
+                    ? '--'
+                    : '${avgNutrient.toStringAsFixed(1)} ppm',
+                progress: ((avgNutrient ?? 0) / 1600).clamp(0, 1),
+                color: const Color(0xFF8B5CF6),
+              ),
+              const SizedBox(height: 10),
+              Text(
+                'Current phase time left: ${_phaseRemainingText(data)}',
+                style: TextStyle(color: Theme.of(context).colorScheme.onSurfaceVariant),
               ),
             ],
           ),
@@ -1773,41 +2236,58 @@ class _OverviewTab extends StatelessWidget {
                     : 'Operating normally',
               ),
               const SizedBox(height: 16),
-              Row(
-                children: [
-                  _TankVisual(
-                    fillPercent: tankPercent,
-                    isLow: (data['tankLow'] ?? false) == true,
-                  ),
-                  const SizedBox(width: 20),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
+              LayoutBuilder(
+                builder: (context, constraints) {
+                  final details = Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        tankDistance == null
+                            ? 'Distance unavailable'
+                            : '${tankDistance.toStringAsFixed(1)} cm',
+                        style: Theme.of(context).textTheme.headlineSmall
+                            ?.copyWith(fontWeight: FontWeight.w700),
+                      ),
+                      const SizedBox(height: 6),
+                      Text(
+                        (data['tankLow'] ?? false) == true
+                            ? 'Water level is below the safe range. Refill soon.'
+                            : 'Water level is in the safe range for the current cycle.',
+                      ),
+                      const SizedBox(height: 14),
+                      _ProgressStrip(
+                        label: 'Freshness',
+                        value: _freshnessValue(data['sampleAgeMs']),
+                        accentColor: const Color(0xFF3B82F6),
+                        valueText: sampleAge,
+                      ),
+                    ],
+                  );
+
+                  if (constraints.maxWidth < 430) {
+                    return Column(
                       children: [
-                        Text(
-                          tankDistance == null
-                              ? 'Distance unavailable'
-                              : '${tankDistance.toStringAsFixed(1)} cm',
-                          style: Theme.of(context).textTheme.headlineSmall
-                              ?.copyWith(fontWeight: FontWeight.w700),
-                        ),
-                        const SizedBox(height: 6),
-                        Text(
-                          (data['tankLow'] ?? false) == true
-                              ? 'Water level is below the safe range. Refill soon.'
-                              : 'Water level is in the safe range for the current cycle.',
+                        _TankVisual(
+                          fillPercent: tankPercent,
+                          isLow: (data['tankLow'] ?? false) == true,
                         ),
                         const SizedBox(height: 14),
-                        _ProgressStrip(
-                          label: 'Freshness',
-                          value: _freshnessValue(data['sampleAgeMs']),
-                          accentColor: const Color(0xFF3B82F6),
-                          valueText: sampleAge,
-                        ),
+                        details,
                       ],
-                    ),
-                  ),
-                ],
+                    );
+                  }
+
+                  return Row(
+                    children: [
+                      _TankVisual(
+                        fillPercent: tankPercent,
+                        isLow: (data['tankLow'] ?? false) == true,
+                      ),
+                      const SizedBox(width: 20),
+                      Expanded(child: details),
+                    ],
+                  );
+                },
               ),
             ],
           ),
@@ -1987,7 +2467,7 @@ class _ZonesTab extends StatelessWidget {
         final zone = zones[index] as Map<String, dynamic>;
         return Card(
           margin: const EdgeInsets.only(bottom: 16),
-          color: const Color(0xFFFDFDFB),
+          color: Theme.of(context).colorScheme.surface,
           elevation: 0,
           shape: RoundedRectangleBorder(
             borderRadius: BorderRadius.circular(24),
@@ -2043,30 +2523,13 @@ class _ZonesTab extends StatelessWidget {
                   ],
                 ),
                 const SizedBox(height: 12),
-                Row(
-                  children: [
-                    Expanded(
-                      child: _MetricGauge(
-                        label: 'Humidity',
-                        value: _asDouble(zone['humidityPct']),
-                        display: '${zone['humidityPct'] ?? '--'} %',
-                        progress: ((_asDouble(zone['humidityPct']) ?? 0) / 100)
-                            .clamp(0, 1),
-                        color: const Color(0xFF3B82F6),
-                      ),
-                    ),
-                    const SizedBox(width: 12),
-                    Expanded(
-                      child: _MetricGauge(
-                        label: 'Plant food',
-                        value: _asDouble(zone['nutrientPpm']),
-                        display: '${zone['nutrientPpm'] ?? '--'} ppm',
-                        progress: ((_asDouble(zone['nutrientPpm']) ?? 0) / 1600)
-                            .clamp(0, 1),
-                        color: const Color(0xFFA855F7),
-                      ),
-                    ),
-                  ],
+                _MetricGauge(
+                  label: 'Plant food',
+                  value: _asDouble(zone['nutrientPpm']),
+                  display: '${zone['nutrientPpm'] ?? '--'} ppm',
+                  progress: ((_asDouble(zone['nutrientPpm']) ?? 0) / 1600)
+                      .clamp(0, 1),
+                  color: const Color(0xFFA855F7),
                 ),
                 const SizedBox(height: 16),
                 _MiniChartCard(
@@ -2091,7 +2554,8 @@ class _ZonesTab extends StatelessWidget {
                 const SizedBox(height: 16),
                 Container(
                   decoration: BoxDecoration(
-                    color: const Color(0xFFF1F5EF),
+                    color: Theme.of(context).colorScheme.surfaceContainerHighest
+                        .withValues(alpha: 0.35),
                     borderRadius: BorderRadius.circular(18),
                   ),
                   padding: const EdgeInsets.all(14),
@@ -2365,6 +2829,285 @@ class _DeviceTab extends StatelessWidget {
   }
 }
 
+class _HelpTab extends StatelessWidget {
+  const _HelpTab({
+    required this.deviceId,
+    required this.currentStep,
+    required this.doneSteps,
+    required this.onContinueGuide,
+    required this.onRestartGuide,
+  });
+
+  final String deviceId;
+  final int currentStep;
+  final Set<String> doneSteps;
+  final Future<void> Function() onContinueGuide;
+  final Future<void> Function() onRestartGuide;
+
+  @override
+  Widget build(BuildContext context) {
+    final steps = manualGuideSteps();
+    return ListView(
+      padding: const EdgeInsets.all(16),
+      children: [
+        _SectionCard(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const _SectionHeader(
+                title: 'Quick guide',
+                subtitle: 'Step-by-step help for setup and daily use',
+              ),
+              const SizedBox(height: 12),
+              _DetailRow(
+                label: 'Completed',
+                value: '${doneSteps.length}/${steps.length} steps',
+              ),
+              _DetailRow(
+                label: 'Next step',
+                value: '${(currentStep + 1).clamp(1, steps.length)}',
+              ),
+              const SizedBox(height: 12),
+              Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: [
+                  FilledButton.icon(
+                    onPressed: () => unawaited(onContinueGuide()),
+                    icon: const Icon(Icons.play_arrow),
+                    label: const Text('Continue guide'),
+                  ),
+                  OutlinedButton.icon(
+                    onPressed: () => unawaited(onRestartGuide()),
+                    icon: const Icon(Icons.restart_alt),
+                    label: const Text('Start over'),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 16),
+        _SectionCard(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const _SectionHeader(
+                title: 'Guide checklist',
+                subtitle: 'Use this as your daily reference',
+              ),
+              const SizedBox(height: 8),
+              for (int i = 0; i < steps.length; i++)
+                ListTile(
+                  contentPadding: EdgeInsets.zero,
+                  leading: Icon(
+                    doneSteps.contains(steps[i].id)
+                        ? Icons.check_circle
+                        : Icons.radio_button_unchecked,
+                  ),
+                  title: Text(steps[i].title),
+                  subtitle: Text(steps[i].goal),
+                ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class ManualGuideScreen extends StatefulWidget {
+  const ManualGuideScreen({super.key, required this.deviceId});
+
+  final String deviceId;
+
+  @override
+  State<ManualGuideScreen> createState() => _ManualGuideScreenState();
+}
+
+class _ManualGuideScreenState extends State<ManualGuideScreen> {
+  final _steps = manualGuideSteps();
+  int _index = 0;
+  Set<String> _done = <String>{};
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_load());
+  }
+
+  Future<void> _load() async {
+    final current = await ManualGuideStore.loadCurrentStep(widget.deviceId);
+    final done = await ManualGuideStore.loadDoneSteps(widget.deviceId);
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _index = current.clamp(0, _steps.length - 1);
+      _done = done;
+    });
+  }
+
+  Future<void> _save() {
+    return ManualGuideStore.saveProgress(
+      deviceId: widget.deviceId,
+      currentStep: _index,
+      doneSteps: _done,
+    );
+  }
+
+  void _markDone() {
+    setState(() {
+      _done.add(_steps[_index].id);
+    });
+    unawaited(_save());
+  }
+
+  void _next() {
+    if (_index >= _steps.length - 1) {
+      Navigator.of(context).pop();
+      return;
+    }
+    setState(() {
+      _index += 1;
+    });
+    unawaited(_save());
+  }
+
+  void _back() {
+    if (_index == 0) {
+      Navigator.of(context).pop();
+      return;
+    }
+    setState(() {
+      _index -= 1;
+    });
+    unawaited(_save());
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final step = _steps[_index];
+    final compact = MediaQuery.of(context).size.width < 390;
+
+    return Scaffold(
+      appBar: AppBar(title: const Text('Quick guide')),
+      body: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          Text(
+            'Step ${_index + 1} of ${_steps.length}',
+            style: Theme.of(context).textTheme.titleSmall,
+          ),
+          const SizedBox(height: 8),
+          LinearProgressIndicator(value: (_index + 1) / _steps.length),
+          const SizedBox(height: 16),
+          _SectionCard(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  step.title,
+                  style: Theme.of(
+                    context,
+                  ).textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w700),
+                ),
+                const SizedBox(height: 10),
+                Text(step.goal),
+                const SizedBox(height: 14),
+                const Text(
+                  'Do this',
+                  style: TextStyle(fontWeight: FontWeight.w700),
+                ),
+                const SizedBox(height: 8),
+                for (final action in step.actions)
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 6),
+                    child: Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text('• '),
+                        Expanded(child: Text(action)),
+                      ],
+                    ),
+                  ),
+                const SizedBox(height: 10),
+                const Text(
+                  'What should happen',
+                  style: TextStyle(fontWeight: FontWeight.w700),
+                ),
+                const SizedBox(height: 6),
+                Text(step.expected),
+                const SizedBox(height: 10),
+                const Text(
+                  'If it does not work',
+                  style: TextStyle(fontWeight: FontWeight.w700),
+                ),
+                const SizedBox(height: 6),
+                Text(step.troubleshooting),
+              ],
+            ),
+          ),
+          const SizedBox(height: 16),
+          if (compact)
+            Column(
+              children: [
+                SizedBox(
+                  width: double.infinity,
+                  child: OutlinedButton(
+                    onPressed: _back,
+                    child: Text(_index == 0 ? 'Close' : 'Back'),
+                  ),
+                ),
+                const SizedBox(height: 8),
+                SizedBox(
+                  width: double.infinity,
+                  child: FilledButton.tonal(
+                    onPressed: _markDone,
+                    child: const Text('Mark done'),
+                  ),
+                ),
+                const SizedBox(height: 8),
+                SizedBox(
+                  width: double.infinity,
+                  child: FilledButton(
+                    onPressed: _next,
+                    child: Text(_index == _steps.length - 1 ? 'Finish' : 'Next'),
+                  ),
+                ),
+              ],
+            )
+          else
+            Row(
+              children: [
+                Expanded(
+                  child: OutlinedButton(
+                    onPressed: _back,
+                    child: Text(_index == 0 ? 'Close' : 'Back'),
+                  ),
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: FilledButton.tonal(
+                    onPressed: _markDone,
+                    child: const Text('Mark done'),
+                  ),
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: FilledButton(
+                    onPressed: _next,
+                    child: Text(_index == _steps.length - 1 ? 'Finish' : 'Next'),
+                  ),
+                ),
+              ],
+            ),
+        ],
+      ),
+    );
+  }
+}
+
 class QrScannerScreen extends StatefulWidget {
   const QrScannerScreen({super.key});
 
@@ -2427,13 +3170,14 @@ class _HeroCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
     return Card(
-      color: const Color(0xFF1F5A39),
+      color: scheme.primaryContainer,
       child: Padding(
         padding: const EdgeInsets.all(20),
         child: Row(
           children: [
-            Icon(icon, color: Colors.white, size: 36),
+            Icon(icon, color: scheme.onPrimaryContainer, size: 36),
             const SizedBox(width: 16),
             Expanded(
               child: Column(
@@ -2443,10 +3187,17 @@ class _HeroCard extends StatelessWidget {
                     title,
                     style: Theme.of(
                       context,
-                    ).textTheme.titleLarge?.copyWith(color: Colors.white),
+                    ).textTheme.titleLarge?.copyWith(
+                      color: scheme.onPrimaryContainer,
+                    ),
                   ),
                   const SizedBox(height: 6),
-                  Text(subtitle, style: const TextStyle(color: Colors.white70)),
+                  Text(
+                    subtitle,
+                    style: TextStyle(
+                      color: scheme.onPrimaryContainer.withValues(alpha: 0.82),
+                    ),
+                  ),
                 ],
               ),
             ),
@@ -2470,21 +3221,22 @@ class _OnboardingStep extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
     return Row(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         Container(
           width: 32,
           height: 32,
-          decoration: const BoxDecoration(
-            color: Color(0xFF1F5A39),
+          decoration: BoxDecoration(
+            color: scheme.primary,
             shape: BoxShape.circle,
           ),
           alignment: Alignment.center,
           child: Text(
             number,
-            style: const TextStyle(
-              color: Colors.white,
+            style: TextStyle(
+              color: scheme.onPrimary,
               fontWeight: FontWeight.w700,
             ),
           ),
@@ -2501,7 +3253,7 @@ class _OnboardingStep extends StatelessWidget {
                 ).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w700),
               ),
               const SizedBox(height: 4),
-              Text(body, style: const TextStyle(color: Color(0xFF5E6B63))),
+              Text(body, style: TextStyle(color: scheme.onSurfaceVariant)),
             ],
           ),
         ),
@@ -2510,26 +3262,125 @@ class _OnboardingStep extends StatelessWidget {
   }
 }
 
+class _ConnectionStatusStrip extends StatelessWidget {
+  const _ConnectionStatusStrip({
+    required this.health,
+    required this.message,
+    required this.onRetry,
+  });
+
+  final ConnectionHealth health;
+  final String message;
+  final VoidCallback? onRetry;
+
+  @override
+  Widget build(BuildContext context) {
+    final dark = Theme.of(context).brightness == Brightness.dark;
+    late final Color background;
+    late final Color foreground;
+    late final Color textColor;
+    late final IconData icon;
+    late final String label;
+
+    switch (health) {
+      case ConnectionHealth.online:
+        background = dark ? const Color(0xFF173025) : const Color(0xFFDDEFE3);
+        foreground = dark ? const Color(0xFF67D39B) : const Color(0xFF1D5B3A);
+        textColor = dark ? const Color(0xFFCFEBDD) : const Color(0xFF244536);
+        icon = Icons.check_circle;
+        label = 'Online';
+      case ConnectionHealth.recovering:
+        background = dark ? const Color(0xFF36280F) : const Color(0xFFFDF0D8);
+        foreground = dark ? const Color(0xFFF2B35A) : const Color(0xFF9A5D00);
+        textColor = dark ? const Color(0xFFF6DFC0) : const Color(0xFF5B3A11);
+        icon = Icons.autorenew;
+        label = 'Reconnecting';
+      case ConnectionHealth.offline:
+        background = dark ? const Color(0xFF321D1D) : const Color(0xFFF6DFDF);
+        foreground = dark ? const Color(0xFFFF8F8F) : const Color(0xFF8C2D2D);
+        textColor = dark ? const Color(0xFFFFCFCF) : const Color(0xFF5B2525);
+        icon = Icons.wifi_off;
+        label = 'Offline';
+    }
+
+    return Material(
+      color: background,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Icon(icon, color: foreground),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 10,
+                      vertical: 3,
+                    ),
+                    decoration: BoxDecoration(
+                      color: foreground.withValues(alpha: 0.14),
+                      borderRadius: BorderRadius.circular(999),
+                    ),
+                    child: Text(
+                      label,
+                      style: TextStyle(
+                        color: foreground,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 6),
+                  Text(
+                    message,
+                    softWrap: true,
+                    style: TextStyle(color: textColor),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(width: 8),
+            TextButton(
+              onPressed: onRetry,
+              style: TextButton.styleFrom(foregroundColor: foreground),
+              child: const Text('Retry'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
 class _SectionCard extends StatelessWidget {
   const _SectionCard({
     required this.child,
-    this.backgroundColor = Colors.white,
+    this.backgroundColor,
     this.padding = const EdgeInsets.all(16),
   });
 
   final Widget child;
-  final Color backgroundColor;
+  final Color? backgroundColor;
   final EdgeInsets padding;
 
   @override
   Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final cardColor = backgroundColor ?? scheme.surface;
+    final shadowColor = Theme.of(context).brightness == Brightness.dark
+        ? Colors.black.withValues(alpha: 0.30)
+        : const Color(0x14000000);
+
     return Container(
       decoration: BoxDecoration(
-        color: backgroundColor,
+        color: cardColor,
         borderRadius: BorderRadius.circular(24),
-        boxShadow: const [
+        boxShadow: [
           BoxShadow(
-            color: Color(0x14000000),
+            color: shadowColor,
             blurRadius: 18,
             offset: Offset(0, 8),
           ),
@@ -2560,7 +3411,10 @@ class _SectionHeader extends StatelessWidget {
         const SizedBox(height: 4),
         Text(
           subtitle,
-          style: const TextStyle(color: Color(0xFF5E6B63), height: 1.35),
+          style: TextStyle(
+            color: Theme.of(context).colorScheme.onSurfaceVariant,
+            height: 1.35,
+          ),
         ),
       ],
     );
@@ -2607,16 +3461,24 @@ class _ProgressStrip extends StatelessWidget {
     required this.value,
     required this.accentColor,
     required this.valueText,
+    this.lightOnDark = false,
   });
 
   final String label;
   final double value;
   final Color accentColor;
   final String valueText;
+  final bool lightOnDark;
 
   @override
   Widget build(BuildContext context) {
     final clamped = value.clamp(0, 1).toDouble();
+    final scheme = Theme.of(context).colorScheme;
+    final labelColor = lightOnDark ? const Color(0xFFD9ECE2) : scheme.onSurfaceVariant;
+    final valueColor = lightOnDark ? Colors.white : scheme.onSurface;
+    final backgroundColor = lightOnDark
+        ? const Color(0x1FFFFFFF)
+        : scheme.surfaceContainer;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -2625,13 +3487,13 @@ class _ProgressStrip extends StatelessWidget {
             Expanded(
               child: Text(
                 label,
-                style: const TextStyle(color: Color(0xFFD9ECE2)),
+                style: TextStyle(color: labelColor),
               ),
             ),
             Text(
               valueText,
-              style: const TextStyle(
-                color: Colors.white,
+              style: TextStyle(
+                color: valueColor,
                 fontWeight: FontWeight.w700,
               ),
             ),
@@ -2643,79 +3505,11 @@ class _ProgressStrip extends StatelessWidget {
           child: LinearProgressIndicator(
             minHeight: 10,
             value: clamped,
-            backgroundColor: const Color(0x1FFFFFFF),
+            backgroundColor: backgroundColor,
             valueColor: AlwaysStoppedAnimation<Color>(accentColor),
           ),
         ),
       ],
-    );
-  }
-}
-
-class _SpotlightCard extends StatelessWidget {
-  const _SpotlightCard({
-    required this.title,
-    required this.value,
-    required this.subtitle,
-    required this.progress,
-    required this.accentColor,
-  });
-
-  final String title;
-  final String value;
-  final String subtitle;
-  final double progress;
-  final Color accentColor;
-
-  @override
-  Widget build(BuildContext context) {
-    return _SectionCard(
-      padding: const EdgeInsets.all(12),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Text(
-            title,
-            textAlign: TextAlign.center,
-            style: Theme.of(
-              context,
-            ).textTheme.bodySmall?.copyWith(fontWeight: FontWeight.w700),
-          ),
-          const SizedBox(height: 6),
-          Text(
-            value,
-            textAlign: TextAlign.center,
-            style: Theme.of(context).textTheme.titleLarge?.copyWith(
-              fontWeight: FontWeight.w800,
-              height: 1.0,
-            ),
-          ),
-          const SizedBox(height: 8),
-          SizedBox(
-            width: 60,
-            height: 60,
-            child: Stack(
-              alignment: Alignment.center,
-              children: [
-                CircularProgressIndicator(
-                  value: progress.clamp(0, 1),
-                  strokeWidth: 6,
-                  backgroundColor: const Color(0xFFE4ECE6),
-                  valueColor: AlwaysStoppedAnimation<Color>(accentColor),
-                ),
-              ],
-            ),
-          ),
-          const SizedBox(height: 6),
-          Text(
-            subtitle,
-            textAlign: TextAlign.center,
-            style: const TextStyle(color: Color(0xFF5E6B63), fontSize: 10),
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-          ),
-        ],
-      ),
     );
   }
 }
@@ -2733,12 +3527,13 @@ class _SummaryStatCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
     return _SectionCard(
       padding: const EdgeInsets.all(14),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text(title, style: const TextStyle(color: Color(0xFF5E6B63))),
+          Text(title, style: TextStyle(color: scheme.onSurfaceVariant)),
           const SizedBox(height: 10),
           Text(
             value,
@@ -2747,7 +3542,7 @@ class _SummaryStatCard extends StatelessWidget {
             ).textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w800),
           ),
           const SizedBox(height: 6),
-          Text(subtitle, style: const TextStyle(color: Color(0xFF5E6B63))),
+          Text(subtitle, style: TextStyle(color: scheme.onSurfaceVariant)),
         ],
       ),
     );
@@ -2771,6 +3566,7 @@ class _ManualPumpCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
     final configured = (pumpState?['configured'] ?? false) == true;
     final active = (pumpState?['active'] ?? false) == true;
     final runningRemainingMs =
@@ -2806,7 +3602,7 @@ class _ManualPumpCard extends StatelessWidget {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text(title, style: const TextStyle(color: Color(0xFF5E6B63))),
+          Text(title, style: TextStyle(color: scheme.onSurfaceVariant)),
           const SizedBox(height: 8),
           Text(
             status,
@@ -2902,12 +3698,13 @@ class _MiniChartCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
     final latest = series.isEmpty
         ? '--'
         : '${series.last.toStringAsFixed(0)}$suffix';
     return Container(
       decoration: BoxDecoration(
-        color: const Color(0xFFF7FAF7),
+        color: scheme.surfaceContainerHighest.withValues(alpha: 0.45),
         borderRadius: BorderRadius.circular(18),
       ),
       padding: const EdgeInsets.all(14),
@@ -2929,7 +3726,7 @@ class _MiniChartCard extends StatelessWidget {
                     const SizedBox(height: 4),
                     Text(
                       subtitle,
-                      style: const TextStyle(color: Color(0xFF5E6B63)),
+                      style: TextStyle(color: scheme.onSurfaceVariant),
                     ),
                   ],
                 ),
@@ -2996,16 +3793,17 @@ class _MetricGauge extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
     return Container(
       decoration: BoxDecoration(
-        color: const Color(0xFFF7FAF7),
+        color: scheme.surfaceContainerHighest.withValues(alpha: 0.45),
         borderRadius: BorderRadius.circular(18),
       ),
       padding: const EdgeInsets.all(14),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text(label, style: const TextStyle(color: Color(0xFF5E6B63))),
+          Text(label, style: TextStyle(color: scheme.onSurfaceVariant)),
           const SizedBox(height: 8),
           Text(
             display,
@@ -3019,7 +3817,7 @@ class _MetricGauge extends StatelessWidget {
             child: LinearProgressIndicator(
               minHeight: 10,
               value: progress.clamp(0, 1),
-              backgroundColor: const Color(0xFFE4ECE6),
+              backgroundColor: scheme.surfaceContainer,
               valueColor: AlwaysStoppedAnimation<Color>(color),
             ),
           ),
@@ -3037,15 +3835,27 @@ class _NpkCell extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
     return Column(
+      crossAxisAlignment: CrossAxisAlignment.center,
       children: [
-        Text(label, style: const TextStyle(color: Color(0xFF5E6B63))),
-        const SizedBox(height: 6),
         Text(
-          value,
-          style: Theme.of(
-            context,
-          ).textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w800),
+          label,
+          style: TextStyle(color: scheme.onSurfaceVariant, fontSize: 12),
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+        ),
+        const SizedBox(height: 6),
+        FittedBox(
+          fit: BoxFit.scaleDown,
+          child: Text(
+            value,
+            maxLines: 1,
+            style: Theme.of(context).textTheme.titleLarge?.copyWith(
+              fontWeight: FontWeight.w800,
+              fontSize: 22,
+            ),
+          ),
         ),
       ],
     );
@@ -3057,18 +3867,15 @@ class _ZoneHistory {
 
   final List<double> moisture = <double>[];
   final List<double> temperature = <double>[];
-  final List<double> humidity = <double>[];
   final List<double> nutrient = <double>[];
 
   void addSample({
     double? moisture,
     double? temperature,
-    double? humidity,
     double? nutrient,
   }) {
     _push(this.moisture, moisture);
     _push(this.temperature, temperature);
-    _push(this.humidity, humidity);
     _push(this.nutrient, nutrient);
   }
 
@@ -3232,21 +4039,6 @@ double _tankPercent(double? tankDistance, bool isLow) {
     return clamped.clamp(0.08, 0.28);
   }
   return clamped;
-}
-
-String _moistureBandLabel(double moisture) {
-  if (moisture < 20) return 'Very dry';
-  if (moisture < 30) return 'A little dry';
-  if (moisture <= 45) return 'Good range';
-  return 'Too wet';
-}
-
-String _nutrientBandLabel(double nutrient) {
-  if (nutrient < 600) return 'Very low';
-  if (nutrient < 800) return 'Low';
-  if (nutrient <= 1200) return 'Good range';
-  if (nutrient <= 1400) return 'A little high';
-  return 'Too high';
 }
 
 List<double> _combineSeries(List<double> a, List<double> b) {
