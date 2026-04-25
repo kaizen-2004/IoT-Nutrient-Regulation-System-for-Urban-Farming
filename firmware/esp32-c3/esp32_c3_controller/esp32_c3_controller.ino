@@ -10,6 +10,7 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <Wire.h>
+#include <ctype.h>
 
 // ESP32-C3 firmware for thesis project:
 // Vertical Farm Controller Firmware
@@ -57,7 +58,12 @@ void stopProvisioningMode();
 void pollSetupResetButton();
 void writePumpGroupPins(const uint8_t *pins, uint8_t count, bool open);
 void setupPumpGroupPins(const uint8_t *pins, uint8_t count);
+bool relayPinActiveHigh(uint8_t pin);
 uint8_t countAssignedPumpPins(const uint8_t *pins, uint8_t count);
+void enforceActuationStartGap();
+void noteActuationStarted();
+void enforceStartupValveOffWindow();
+void enforceActuationSafetyWatchdog();
 void pollUnoTelemetryLink(bool emitEvents);
 bool parseUnoTelemetryFrame(const char *line, ZoneReadings *outReadings, float &outTankDistanceCm);
 uint8_t xorFrameCrc(const char *text, size_t len);
@@ -71,9 +77,18 @@ String buildHealthJSON();
 String buildQrPayloadJSON();
 String jsonEscape(const String &input);
 bool extractJsonStringField(const String &json, const char *fieldName, String &outValue);
+bool extractJsonUIntField(const String &json, const char *fieldName, uint32_t &outValue);
 String currentNetworkIp();
 String deviceId();
 String provisioningApSsid();
+const char *manualPumpIdByIndex(uint8_t index);
+int8_t manualPumpIndexFromId(const String &pumpId);
+uint8_t manualPumpPinFromIndex(uint8_t index);
+bool manualPumpIsConfigured(uint8_t index);
+const char *manualPumpStateText(uint8_t index, uint32_t now);
+void setManualPumpPin(uint8_t index, bool open);
+void updateManualPumpRunState();
+void handleManualPump();
 #if ENABLE_LOCAL_API_SERVER
 void setupMDNSService();
 void ensureMDNSService();
@@ -90,6 +105,12 @@ const char *METHODOLOGY_PROFILE = "chapter3_baseline_v1";
 const uint32_t IDLE_DURATION_MS = 30UL * 60UL * 1000UL;
 const uint32_t ACTIVE_DURATION_MS = 10UL * 60UL * 1000UL;
 const uint32_t BETWEEN_VALVE_DELAY_MS = 15UL * 1000UL;
+const uint32_t ACTUATION_START_GAP_MS = 1500UL;
+const uint32_t STARTUP_FORCE_OFF_WINDOW_MS = 8000UL;
+const uint32_t STARTUP_FORCE_OFF_INTERVAL_MS = 200UL;
+const uint32_t MAX_WATER_VALVE_ON_MS = 4UL * 60UL * 1000UL;
+const uint32_t MAX_NUTRIENT_VALVE_ON_MS = 3UL * 60UL * 1000UL;
+const uint32_t MANUAL_WATCHDOG_GRACE_MS = 3000UL;
 
 const uint32_t MIN_WATER_PULSE_MS = 45UL * 1000UL;
 const uint32_t MAX_WATER_PULSE_MS = 3UL * 60UL * 1000UL;
@@ -122,7 +143,7 @@ const float HUMIDITY_DRY_WATER_BOOST_RATIO = 0.10f;
 const float TEMP_COLD_WATER_REDUCTION_FACTOR = 0.60f;
 const float HUMIDITY_HIGH_WATER_REDUCTION_FACTOR = 0.70f;
 
-// Relay configuration (set to false if your relay board is active-low)
+// Relay configuration (set to true if your relay board is active-high)
 const bool VALVE_ACTIVE_HIGH = false;
 
 // Tank level threshold (distance from ultrasonic sensor, reported by Uno).
@@ -137,18 +158,24 @@ const float TANK_MAX_VALID_DISTANCE_CM = 300.0f;
 
 // Pin map for ESP32-C3 (adjust for your exact board wiring)
 const uint8_t WATER_VALVE_PIN = 6;
-const uint8_t NUTRIENT_VALVE_PIN = 7;
+const uint8_t NUTRIENT_VALVE_PIN = 5;
 const uint8_t UNASSIGNED_PUMP_PIN = 255;
 const uint8_t WATER_PUMP_PIN_COUNT = 4;
 const uint8_t NUTRIENT_PUMP_PIN_COUNT = 2;
 const uint8_t WATER_PUMP_PINS[WATER_PUMP_PIN_COUNT] = {
     WATER_VALVE_PIN,
-    4,
+    7,
     3,
-    5};
+    4};
 const uint8_t NUTRIENT_PUMP_PINS[NUTRIENT_PUMP_PIN_COUNT] = {
     NUTRIENT_VALVE_PIN,
     10};
+const uint8_t MANUAL_PUMP_COUNT = 6;
+const uint32_t MANUAL_MIN_PULSE_MS = 3000UL;
+const uint32_t MANUAL_MAX_PULSE_MS = 15000UL;
+const uint32_t MANUAL_COOLDOWN_MS = 10000UL;
+const uint32_t MANUAL_RATE_LIMIT_MS = 1500UL;
+const uint8_t NO_ACTIVE_MANUAL_PUMP = 255;
 const uint8_t RS485_TX_PIN = 21;
 const uint8_t RS485_RX_PIN = 20;
 const uint32_t RS485_BAUD = 19200;
@@ -246,6 +273,11 @@ uint32_t lastCycleCompletedAtMs = 0;
 uint32_t lastTelemetrySampleAtMs = 0;
 bool waterValveOpen = false;
 bool nutrientValveOpen = false;
+uint32_t waterValveOpenedAtMs = 0;
+uint32_t nutrientValveOpenedAtMs = 0;
+uint32_t lastActuationStartAtMs = 0;
+uint32_t startupForceOffUntilMs = 0;
+uint32_t lastStartupForceOffAtMs = 0;
 
 String lastAlertMessage = "none";
 bool apiServerStarted = false;
@@ -283,6 +315,10 @@ bool prevMoistureLowState[NUM_ZONES] = {false, false};
 bool prevNutrientLowState[NUM_ZONES] = {false, false};
 bool prevNutrientHighState[NUM_ZONES] = {false, false};
 bool prevNutrientCriticalState[NUM_ZONES] = {false, false};
+uint32_t manualPumpCooldownUntilMs[MANUAL_PUMP_COUNT] = {0, 0, 0, 0, 0, 0};
+uint8_t activeManualPumpIndex = NO_ACTIVE_MANUAL_PUMP;
+uint32_t manualPumpActiveUntilMs = 0;
+uint32_t lastManualPumpRequestAtMs = 0;
 
 #if ENABLE_LOCAL_API_SERVER
 const char DASHBOARD_HTML[] PROGMEM = R"HTML(
@@ -3011,7 +3047,6 @@ uint32_t blendDemandDuration(uint32_t maxDurationMs, uint32_t sumDurationMs, uin
 
 void writePumpGroupPins(const uint8_t *pins, uint8_t count, bool open)
 {
-  bool level = open ? VALVE_ACTIVE_HIGH : !VALVE_ACTIVE_HIGH;
   for (uint8_t i = 0; i < count; i++)
   {
     uint8_t pin = pins[i];
@@ -3019,8 +3054,16 @@ void writePumpGroupPins(const uint8_t *pins, uint8_t count, bool open)
     {
       continue;
     }
+    bool activeHigh = relayPinActiveHigh(pin);
+    bool level = open ? activeHigh : !activeHigh;
     digitalWrite(pin, level ? HIGH : LOW);
   }
+}
+
+bool relayPinActiveHigh(uint8_t pin)
+{
+  (void)pin;
+  return VALVE_ACTIVE_HIGH;
 }
 
 void setupPumpGroupPins(const uint8_t *pins, uint8_t count)
@@ -3049,9 +3092,206 @@ uint8_t countAssignedPumpPins(const uint8_t *pins, uint8_t count)
   return assigned;
 }
 
+const char *manualPumpIdByIndex(uint8_t index)
+{
+  switch (index)
+  {
+  case 0:
+    return "zone1Water1";
+  case 1:
+    return "zone1Water2";
+  case 2:
+    return "zone1Nutrient";
+  case 3:
+    return "zone2Water1";
+  case 4:
+    return "zone2Water2";
+  case 5:
+    return "zone2Nutrient";
+  default:
+    return "unknown";
+  }
+}
+
+int8_t manualPumpIndexFromId(const String &pumpId)
+{
+  for (uint8_t i = 0; i < MANUAL_PUMP_COUNT; i++)
+  {
+    if (pumpId == manualPumpIdByIndex(i))
+    {
+      return (int8_t)i;
+    }
+  }
+  return -1;
+}
+
+uint8_t manualPumpPinFromIndex(uint8_t index)
+{
+  switch (index)
+  {
+  case 0:
+    return WATER_PUMP_PINS[0];
+  case 1:
+    return WATER_PUMP_PINS[1];
+  case 2:
+    return NUTRIENT_PUMP_PINS[0];
+  case 3:
+    return WATER_PUMP_PINS[2];
+  case 4:
+    return WATER_PUMP_PINS[3];
+  case 5:
+    return NUTRIENT_PUMP_PINS[1];
+  default:
+    return UNASSIGNED_PUMP_PIN;
+  }
+}
+
+bool manualPumpIsConfigured(uint8_t index)
+{
+  return manualPumpPinFromIndex(index) != UNASSIGNED_PUMP_PIN;
+}
+
+void setManualPumpPin(uint8_t index, bool open)
+{
+  uint8_t pin = manualPumpPinFromIndex(index);
+  if (pin == UNASSIGNED_PUMP_PIN)
+  {
+    return;
+  }
+
+  bool activeHigh = relayPinActiveHigh(pin);
+  bool level = open ? activeHigh : !activeHigh;
+  digitalWrite(pin, level ? HIGH : LOW);
+}
+
+void updateManualPumpRunState()
+{
+  if (activeManualPumpIndex == NO_ACTIVE_MANUAL_PUMP)
+  {
+    return;
+  }
+
+  uint32_t now = millis();
+  if ((int32_t)(now - manualPumpActiveUntilMs) < 0)
+  {
+    return;
+  }
+
+  uint8_t completedIndex = activeManualPumpIndex;
+  setManualPumpPin(completedIndex, false);
+  manualPumpCooldownUntilMs[completedIndex] = now + MANUAL_COOLDOWN_MS;
+  activeManualPumpIndex = NO_ACTIVE_MANUAL_PUMP;
+  manualPumpActiveUntilMs = 0;
+
+  setAlertMessage(String("Manual pump completed: ") + manualPumpIdByIndex(completedIndex));
+}
+
+const char *manualPumpStateText(uint8_t index, uint32_t now)
+{
+  if (!manualPumpIsConfigured(index))
+  {
+    return "unavailable";
+  }
+
+  if (index == activeManualPumpIndex)
+  {
+    return "running";
+  }
+
+  if ((int32_t)(manualPumpCooldownUntilMs[index] - now) > 0)
+  {
+    return "cooldown";
+  }
+
+  return "ready";
+}
+
+void enforceActuationStartGap()
+{
+  if (lastActuationStartAtMs == 0)
+  {
+    return;
+  }
+
+  uint32_t now = millis();
+  uint32_t elapsed = (uint32_t)(now - lastActuationStartAtMs);
+  if (elapsed >= ACTUATION_START_GAP_MS)
+  {
+    return;
+  }
+
+  uint32_t waitMs = ACTUATION_START_GAP_MS - elapsed;
+  if (waitMs > 0)
+  {
+    delayWithService(waitMs);
+  }
+}
+
+void noteActuationStarted()
+{
+  lastActuationStartAtMs = millis();
+}
+
+void enforceStartupValveOffWindow()
+{
+  if (startupForceOffUntilMs == 0)
+  {
+    return;
+  }
+
+  uint32_t now = millis();
+  if ((int32_t)(now - startupForceOffUntilMs) >= 0)
+  {
+    startupForceOffUntilMs = 0;
+    return;
+  }
+
+  if ((uint32_t)(now - lastStartupForceOffAtMs) < STARTUP_FORCE_OFF_INTERVAL_MS)
+  {
+    return;
+  }
+
+  closeAllValves();
+  if (activeManualPumpIndex != NO_ACTIVE_MANUAL_PUMP)
+  {
+    setManualPumpPin(activeManualPumpIndex, false);
+    activeManualPumpIndex = NO_ACTIVE_MANUAL_PUMP;
+    manualPumpActiveUntilMs = 0;
+  }
+  lastStartupForceOffAtMs = now;
+}
+
+void enforceActuationSafetyWatchdog()
+{
+  uint32_t now = millis();
+
+  if (waterValveOpen && waterValveOpenedAtMs != 0 && (uint32_t)(now - waterValveOpenedAtMs) > MAX_WATER_VALVE_ON_MS)
+  {
+    setValve(WATER_VALVE_PIN, false);
+    setAlertMessage("Safety watchdog: water valve forced off.");
+  }
+
+  if (nutrientValveOpen && nutrientValveOpenedAtMs != 0 && (uint32_t)(now - nutrientValveOpenedAtMs) > MAX_NUTRIENT_VALVE_ON_MS)
+  {
+    setValve(NUTRIENT_VALVE_PIN, false);
+    setAlertMessage("Safety watchdog: nutrient valve forced off.");
+  }
+
+  if (activeManualPumpIndex != NO_ACTIVE_MANUAL_PUMP &&
+      (int32_t)(now - manualPumpActiveUntilMs) > (int32_t)MANUAL_WATCHDOG_GRACE_MS)
+  {
+    setManualPumpPin(activeManualPumpIndex, false);
+    manualPumpCooldownUntilMs[activeManualPumpIndex] = now + MANUAL_COOLDOWN_MS;
+    activeManualPumpIndex = NO_ACTIVE_MANUAL_PUMP;
+    manualPumpActiveUntilMs = 0;
+    setAlertMessage("Safety watchdog: manual pump forced off.");
+  }
+}
+
 void setValve(uint8_t pin, bool open)
 {
-  bool level = open ? VALVE_ACTIVE_HIGH : !VALVE_ACTIVE_HIGH;
+  bool activeHigh = relayPinActiveHigh(pin);
+  bool level = open ? activeHigh : !activeHigh;
   if (pin == WATER_VALVE_PIN)
   {
     writePumpGroupPins(WATER_PUMP_PINS, WATER_PUMP_PIN_COUNT, open);
@@ -3069,6 +3309,7 @@ void setValve(uint8_t pin, bool open)
   {
     bool changed = (waterValveOpen != open);
     waterValveOpen = open;
+    waterValveOpenedAtMs = open ? millis() : 0;
     if (changed && phaseStartedAt > 0)
     {
       setAlertMessage(open ? "Water pump is running." : "Water pump stopped.");
@@ -3078,6 +3319,7 @@ void setValve(uint8_t pin, bool open)
   {
     bool changed = (nutrientValveOpen != open);
     nutrientValveOpen = open;
+    nutrientValveOpenedAtMs = open ? millis() : 0;
     if (changed && phaseStartedAt > 0)
     {
       setAlertMessage(open ? "Nutrient dosing in progress." : "Nutrient dosing completed.");
@@ -3099,7 +3341,9 @@ void runValveFor(uint8_t pin, uint32_t durationMs, const char *valveName)
   }
 
   Serial.printf("{\"type\":\"actuation\",\"valve\":\"%s\",\"durationMs\":%lu}\n", valveName, (unsigned long)durationMs);
+  enforceActuationStartGap();
   setValve(pin, true);
+  noteActuationStarted();
 
   uint32_t startedAt = millis();
   while ((uint32_t)(millis() - startedAt) < durationMs)
@@ -3725,6 +3969,48 @@ bool extractJsonStringField(const String &json, const char *fieldName, String &o
   return false;
 }
 
+bool extractJsonUIntField(const String &json, const char *fieldName, uint32_t &outValue)
+{
+  String needle = String("\"") + fieldName + "\"";
+  int keyStart = json.indexOf(needle);
+  if (keyStart < 0)
+  {
+    return false;
+  }
+
+  int colon = json.indexOf(':', keyStart + needle.length());
+  if (colon < 0)
+  {
+    return false;
+  }
+
+  int i = colon + 1;
+  while (i < json.length() && isspace((unsigned char)json[i]))
+  {
+    i++;
+  }
+
+  if (i >= json.length() || !isdigit((unsigned char)json[i]))
+  {
+    return false;
+  }
+
+  uint32_t value = 0;
+  while (i < json.length() && isdigit((unsigned char)json[i]))
+  {
+    uint8_t digit = (uint8_t)(json[i] - '0');
+    if (value > 429496729UL)
+    {
+      return false;
+    }
+    value = (value * 10UL) + digit;
+    i++;
+  }
+
+  outValue = value;
+  return true;
+}
+
 void sendResponseHeaders()
 {
   apiServer.sendHeader("Access-Control-Allow-Origin", "*");
@@ -3765,6 +4051,7 @@ String buildQrPayloadJSON()
 
 String buildStatusJSON()
 {
+  updateManualPumpRunState();
   uint32_t uptimeMs = millis();
   uint32_t sampleAgeMs = haveCompleteTelemetry() ? (uint32_t)(uptimeMs - lastTelemetrySampleAtMs) : 0;
   uint32_t phaseDurationMs = (phase == PHASE_IDLE) ? IDLE_DURATION_MS : ACTIVE_DURATION_MS;
@@ -3850,6 +4137,20 @@ String buildStatusJSON()
   json += "\"lastAlert\":\"";
   json += jsonEscape(lastAlertMessage);
   json += "\",";
+  json += "\"manual\":{\"pumps\":{";
+  for (uint8_t i = 0; i < MANUAL_PUMP_COUNT; i++)
+  {
+    if (i > 0)
+    {
+      json += ",";
+    }
+    json += "\"";
+    json += manualPumpIdByIndex(i);
+    json += "\":\"";
+    json += manualPumpStateText(i, uptimeMs);
+    json += "\"";
+  }
+  json += "}},";
   json += "\"wifi\":{";
   json += "\"connected\":";
   json += (WiFi.status() == WL_CONNECTED) ? "true" : "false";
@@ -4129,6 +4430,87 @@ void handleResetWiFi()
   startProvisioningMode("wifi_reset");
 }
 
+void handleManualPump()
+{
+  updateManualPumpRunState();
+
+  if (startupForceOffUntilMs != 0 && (int32_t)(startupForceOffUntilMs - millis()) > 0)
+  {
+    sendJsonResponse(409, "{\"reason\":\"busy\"}");
+    return;
+  }
+
+  if (provisioningMode)
+  {
+    sendJsonResponse(409, "{\"reason\":\"busy\"}");
+    return;
+  }
+
+  if (phase == PHASE_ACTIVE || waterValveOpen || nutrientValveOpen || activeManualPumpIndex != NO_ACTIVE_MANUAL_PUMP)
+  {
+    sendJsonResponse(409, "{\"reason\":\"busy\"}");
+    return;
+  }
+
+  uint32_t now = millis();
+  if ((uint32_t)(now - lastManualPumpRequestAtMs) < MANUAL_RATE_LIMIT_MS)
+  {
+    sendJsonResponse(429, "{\"reason\":\"rate_limited\"}");
+    return;
+  }
+
+  String body = apiServer.arg("plain");
+  String pumpId;
+  uint32_t durationMs = 0;
+  if (!extractJsonStringField(body, "pumpId", pumpId) || !extractJsonUIntField(body, "durationMs", durationMs))
+  {
+    sendJsonResponse(400, "{\"reason\":\"invalid_payload\"}");
+    return;
+  }
+
+  int8_t index = manualPumpIndexFromId(pumpId);
+  if (index < 0)
+  {
+    sendJsonResponse(400, "{\"reason\":\"invalid_payload\"}");
+    return;
+  }
+
+  if (durationMs < MANUAL_MIN_PULSE_MS || durationMs > MANUAL_MAX_PULSE_MS)
+  {
+    sendJsonResponse(400, "{\"reason\":\"invalid_duration\"}");
+    return;
+  }
+
+  if (!manualPumpIsConfigured((uint8_t)index))
+  {
+    sendJsonResponse(409, "{\"reason\":\"not_configured\"}");
+    return;
+  }
+
+  if ((int32_t)(manualPumpCooldownUntilMs[index] - now) > 0)
+  {
+    sendJsonResponse(409, "{\"reason\":\"cooldown\"}");
+    return;
+  }
+
+  enforceActuationStartGap();
+  setManualPumpPin((uint8_t)index, true);
+  noteActuationStarted();
+  activeManualPumpIndex = (uint8_t)index;
+  manualPumpActiveUntilMs = now + durationMs;
+  lastManualPumpRequestAtMs = now;
+  setAlertMessage(String("Manual pump running: ") + manualPumpIdByIndex((uint8_t)index));
+
+  String response;
+  response.reserve(160);
+  response += "{\"accepted\":true,\"pumpId\":\"";
+  response += manualPumpIdByIndex((uint8_t)index);
+  response += "\",\"durationMs\":";
+  response += String(durationMs);
+  response += "}";
+  sendJsonResponse(202, response);
+}
+
 void setupApiServer()
 {
   if (!apiRoutesRegistered)
@@ -4147,6 +4529,8 @@ void setupApiServer()
     apiServer.on("/api/provisioning/result", HTTP_OPTIONS, handleOptions);
     apiServer.on("/api/device/reset-wifi", HTTP_POST, handleResetWiFi);
     apiServer.on("/api/device/reset-wifi", HTTP_OPTIONS, handleOptions);
+    apiServer.on("/api/manual/pump", HTTP_POST, handleManualPump);
+    apiServer.on("/api/manual/pump", HTTP_OPTIONS, handleOptions);
     apiServer.on("/healthz", HTTP_GET, handleHealth);
     apiServer.on("/healthz", HTTP_OPTIONS, handleOptions);
     apiServer.onNotFound([]()
@@ -4230,6 +4614,7 @@ String jsonEscape(const String &input)
 
 String buildStatusJSON()
 {
+  updateManualPumpRunState();
   uint32_t uptimeMs = millis();
   uint32_t sampleAgeMs = haveCompleteTelemetry() ? (uint32_t)(uptimeMs - lastTelemetrySampleAtMs) : 0;
   uint32_t phaseDurationMs = (phase == PHASE_IDLE) ? IDLE_DURATION_MS : ACTIVE_DURATION_MS;
@@ -4319,6 +4704,21 @@ String buildStatusJSON()
   json += "\"lastAlert\":\"";
   json += jsonEscape(lastAlertMessage);
   json += "\",";
+
+  json += "\"manual\":{\"pumps\":{";
+  for (uint8_t i = 0; i < MANUAL_PUMP_COUNT; i++)
+  {
+    if (i > 0)
+    {
+      json += ",";
+    }
+    json += "\"";
+    json += manualPumpIdByIndex(i);
+    json += "\":\"";
+    json += manualPumpStateText(i, uptimeMs);
+    json += "\"";
+  }
+  json += "}},";
 
   json += "\"wifi\":{";
   json += "\"connected\":";
@@ -4975,6 +5375,8 @@ void setup()
   pinMode(SETUP_RESET_BUTTON_PIN, SETUP_RESET_BUTTON_ACTIVE_LOW ? INPUT_PULLUP : INPUT);
 
   closeAllValves();
+  startupForceOffUntilMs = millis() + STARTUP_FORCE_OFF_WINDOW_MS;
+  lastStartupForceOffAtMs = 0;
 
   RS485Serial.begin(RS485_BAUD, SERIAL_8N1, RS485_RX_PIN, RS485_TX_PIN);
 
@@ -5015,6 +5417,9 @@ void setup()
 
 void loop()
 {
+  enforceStartupValveOffWindow();
+  enforceActuationSafetyWatchdog();
+  updateManualPumpRunState();
   pollUnoTelemetryLink(false);
   pollSetupResetButton();
   maintainWiFiConnection();
@@ -5032,7 +5437,7 @@ void loop()
 
   if (phase == PHASE_IDLE)
   {
-    if ((uint32_t)(now - phaseStartedAt) >= IDLE_DURATION_MS)
+    if (activeManualPumpIndex == NO_ACTIVE_MANUAL_PUMP && (uint32_t)(now - phaseStartedAt) >= IDLE_DURATION_MS)
     {
       enterPhase(PHASE_ACTIVE);
     }

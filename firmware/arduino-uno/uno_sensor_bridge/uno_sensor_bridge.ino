@@ -20,7 +20,7 @@ const float DEFAULT_TEMP_C = 25.0f;
 const bool USE_FIXED_DS18B20_ADDRS = true;
 
 const uint8_t TANK_TRIG_PIN = 12;
-const uint8_t TANK_ECHO_PIN = A2;
+const uint8_t TANK_ECHO_PIN = 6;
 const uint8_t TANK_SAMPLE_COUNT = 5;
 const uint32_t TANK_PULSE_TIMEOUT_US = 30000UL;
 const float TANK_MIN_VALID_CM = 2.0f;
@@ -34,9 +34,21 @@ const uint8_t RS485_2_RX_PIN = 7;
 const uint8_t RS485_2_TX_PIN = 8;
 const uint8_t RS485_2_DE_RE_PIN = 9;
 const bool RS485_DE_RE_TX_HIGH = true;
-const uint32_t RS485_BAUD = 4800;
-const uint8_t NPK_SENSOR_ADDR = 1;
+const uint32_t RS485_1_BAUD_DEFAULT = 4800;
+const uint32_t RS485_2_BAUD_DEFAULT = 4800;
+const uint8_t RS485_1_SENSOR_ADDR = 1;
+const uint8_t RS485_2_SENSOR_ADDR = 1;
 const uint32_t RS485_RESPONSE_TIMEOUT_MS = 1000;
+const uint8_t RS485_READ_RETRIES = 2;
+const uint32_t RS485_INTER_REQUEST_DELAY_MS = 60;
+const bool ENABLE_RS485_DEBUG = false;
+const bool ENABLE_RS485_1_AUTODETECT = false;
+const bool ENABLE_RS485_CH1_READ = true;
+const bool ENABLE_RS485_CH2_READ = true;
+const uint16_t RS485_AUTODIR_TURNAROUND_DELAY_MS = 4;
+const uint32_t RS485_SCAN_BAUDS[] = {4800, 9600, 2400, 19200};
+const uint8_t RS485_ADDR_SCAN_MIN = 1;
+const uint8_t RS485_ADDR_SCAN_MAX = 8;
 
 const bool ENABLE_DS18B20 = true;
 const bool ENABLE_RS485_NPK = true;
@@ -59,6 +71,10 @@ float lastTemp2 = DEFAULT_TEMP_C;
 float lastN[2] = {0.0f, 0.0f};
 float lastP[2] = {0.0f, 0.0f};
 float lastK[2] = {0.0f, 0.0f};
+uint32_t rs485BaudCh1 = RS485_1_BAUD_DEFAULT;
+uint32_t rs485BaudCh2 = RS485_2_BAUD_DEFAULT;
+uint8_t rs485AddrCh1 = RS485_1_SENSOR_ADDR;
+uint8_t rs485AddrCh2 = RS485_2_SENSOR_ADDR;
 
 uint8_t xorCrc(const char *text, size_t len) {
   uint8_t crc = 0;
@@ -90,6 +106,22 @@ void rs485SetTx(uint8_t deRePin, bool tx) {
   }
   bool level = tx ? RS485_DE_RE_TX_HIGH : !RS485_DE_RE_TX_HIGH;
   digitalWrite(deRePin, level ? HIGH : LOW);
+}
+
+void printHexByte(uint8_t value) {
+  if (value < 0x10) {
+    Serial.print('0');
+  }
+  Serial.print(value, HEX);
+}
+
+void printHexFrame(const uint8_t *data, size_t len) {
+  for (size_t i = 0; i < len; i++) {
+    printHexByte(data[i]);
+    if (i + 1 < len) {
+      Serial.print(' ');
+    }
+  }
 }
 
 float moisturePercentFromRaw(int raw) {
@@ -188,7 +220,12 @@ void readDs18b20Temps(float &temp1, float &temp2) {
   }
 }
 
-bool readHoldingRegister(SoftwareSerial &bus, uint8_t deRePin, uint8_t addr, uint16_t reg, uint16_t &out) {
+bool readHoldingRegister(SoftwareSerial &bus,
+                         uint8_t deRePin,
+                         const char *channelName,
+                         uint8_t addr,
+                         uint16_t reg,
+                         uint16_t &out) {
   uint8_t req[8];
   req[0] = addr;
   req[1] = 0x03;
@@ -200,48 +237,147 @@ bool readHoldingRegister(SoftwareSerial &bus, uint8_t deRePin, uint8_t addr, uin
   req[6] = (uint8_t)(crc & 0xFF);
   req[7] = (uint8_t)((crc >> 8) & 0xFF);
 
-  bus.listen();
-  while (bus.available()) {
-    bus.read();
-  }
-
-  rs485SetTx(deRePin, true);
-  bus.write(req, sizeof(req));
-  bus.flush();
-  rs485SetTx(deRePin, false);
-
-  uint8_t resp[16];
-  size_t len = 0;
-  uint32_t startedAt = millis();
-  while ((uint32_t)(millis() - startedAt) < RS485_RESPONSE_TIMEOUT_MS) {
-    while (bus.available() && len < sizeof(resp)) {
-      resp[len++] = (uint8_t)bus.read();
+  for (uint8_t attempt = 0; attempt <= RS485_READ_RETRIES; attempt++) {
+    bus.listen();
+    while (bus.available()) {
+      bus.read();
     }
-    if (len >= 7) {
-      break;
+
+    rs485SetTx(deRePin, true);
+    bus.write(req, sizeof(req));
+    bus.flush();
+    rs485SetTx(deRePin, false);
+    if (deRePin == UNASSIGNED_PIN) {
+      delay(RS485_AUTODIR_TURNAROUND_DELAY_MS);
     }
+
+    uint8_t resp[16];
+    size_t len = 0;
+    uint32_t startedAt = millis();
+    while ((uint32_t)(millis() - startedAt) < RS485_RESPONSE_TIMEOUT_MS) {
+      while (bus.available() && len < sizeof(resp)) {
+        resp[len++] = (uint8_t)bus.read();
+      }
+      if (len >= 7) {
+        break;
+      }
+    }
+
+    espLink.listen();
+
+    bool ok = true;
+    if (len < 7) {
+      ok = false;
+      if (ENABLE_RS485_DEBUG) {
+        Serial.print("[rs485]");
+        Serial.print(channelName);
+        Serial.print(" timeout attempt=");
+        Serial.print(attempt + 1);
+        Serial.print(" addr=");
+        Serial.print(addr);
+        Serial.print(" reg=0x");
+        Serial.println(reg, HEX);
+      }
+    }
+
+    if (ok && (resp[0] != addr || resp[1] != 0x03 || resp[2] != 0x02)) {
+      ok = false;
+      if (ENABLE_RS485_DEBUG) {
+        Serial.print("[rs485]");
+        Serial.print(channelName);
+        Serial.print(" bad-header attempt=");
+        Serial.print(attempt + 1);
+        Serial.print(" resp=");
+        printHexFrame(resp, len);
+        Serial.println();
+      }
+    }
+
+    if (ok) {
+      uint16_t crcResp = (uint16_t)resp[len - 2] | ((uint16_t)resp[len - 1] << 8);
+      uint16_t crcCalc = modbusCrc16(resp, len - 2);
+      if (crcResp != crcCalc) {
+        ok = false;
+        if (ENABLE_RS485_DEBUG) {
+          Serial.print("[rs485]");
+          Serial.print(channelName);
+          Serial.print(" crc-fail attempt=");
+          Serial.print(attempt + 1);
+          Serial.print(" calc=0x");
+          Serial.print(crcCalc, HEX);
+          Serial.print(" resp=0x");
+          Serial.print(crcResp, HEX);
+          Serial.print(" frame=");
+          printHexFrame(resp, len);
+          Serial.println();
+        }
+      }
+    }
+
+    if (ok) {
+      out = ((uint16_t)resp[3] << 8) | (uint16_t)resp[4];
+      return true;
+    }
+
+    delay(RS485_INTER_REQUEST_DELAY_MS);
   }
 
-  espLink.listen();
-
-  if (len < 7) {
-    return false;
-  }
-  if (resp[0] != addr || resp[1] != 0x03 || resp[2] != 0x02) {
-    return false;
-  }
-
-  uint16_t crcResp = (uint16_t)resp[len - 2] | ((uint16_t)resp[len - 1] << 8);
-  uint16_t crcCalc = modbusCrc16(resp, len - 2);
-  if (crcResp != crcCalc) {
-    return false;
-  }
-
-  out = ((uint16_t)resp[3] << 8) | (uint16_t)resp[4];
-  return true;
+  return false;
 }
 
-void readNpkFromChannel(uint8_t channelIndex, SoftwareSerial &bus, uint8_t deRePin, float &n, float &p, float &k) {
+bool autodetectRs485Channel(SoftwareSerial &bus,
+                            uint8_t deRePin,
+                            const char *channelName,
+                            uint32_t &detectedBaud,
+                            uint8_t &detectedAddr) {
+  for (size_t b = 0; b < (sizeof(RS485_SCAN_BAUDS) / sizeof(RS485_SCAN_BAUDS[0])); b++) {
+    uint32_t baud = RS485_SCAN_BAUDS[b];
+    bus.begin(baud);
+    delay(80);
+
+    if (ENABLE_RS485_DEBUG) {
+      Serial.print("[rs485]");
+      Serial.print(channelName);
+      Serial.print(" scan baud=");
+      Serial.println(baud);
+    }
+
+    for (uint8_t addr = RS485_ADDR_SCAN_MIN; addr <= RS485_ADDR_SCAN_MAX; addr++) {
+      uint16_t val = 0;
+      if (readHoldingRegister(bus, deRePin, channelName, addr, 0x001E, val)) {
+        detectedBaud = baud;
+        detectedAddr = addr;
+        if (ENABLE_RS485_DEBUG) {
+          Serial.print("[rs485]");
+          Serial.print(channelName);
+          Serial.print(" detected addr=");
+          Serial.print(addr);
+          Serial.print(" baud=");
+          Serial.print(baud);
+          Serial.print(" nReg=");
+          Serial.println(val);
+        }
+        return true;
+      }
+    }
+  }
+
+  if (ENABLE_RS485_DEBUG) {
+    Serial.print("[rs485]");
+    Serial.print(channelName);
+    Serial.println(" autodetect failed");
+  }
+  return false;
+}
+
+void readNpkFromChannel(uint8_t channelIndex,
+                        SoftwareSerial &bus,
+                        uint8_t deRePin,
+                        const char *channelName,
+                        uint8_t addr,
+                        float &n,
+                        float &p,
+                        float &k) {
   n = lastN[channelIndex];
   p = lastP[channelIndex];
   k = lastK[channelIndex];
@@ -253,9 +389,9 @@ void readNpkFromChannel(uint8_t channelIndex, SoftwareSerial &bus, uint8_t deReP
   uint16_t nReg = 0;
   uint16_t pReg = 0;
   uint16_t kReg = 0;
-  bool okN = readHoldingRegister(bus, deRePin, NPK_SENSOR_ADDR, 0x001E, nReg);
-  bool okP = readHoldingRegister(bus, deRePin, NPK_SENSOR_ADDR, 0x001F, pReg);
-  bool okK = readHoldingRegister(bus, deRePin, NPK_SENSOR_ADDR, 0x0020, kReg);
+  bool okN = readHoldingRegister(bus, deRePin, channelName, addr, 0x001E, nReg);
+  bool okP = readHoldingRegister(bus, deRePin, channelName, addr, 0x001F, pReg);
+  bool okK = readHoldingRegister(bus, deRePin, channelName, addr, 0x0020, kReg);
   if (okN && okP && okK) {
     n = (float)nReg;
     p = (float)pReg;
@@ -263,6 +399,11 @@ void readNpkFromChannel(uint8_t channelIndex, SoftwareSerial &bus, uint8_t deReP
     lastN[channelIndex] = n;
     lastP[channelIndex] = p;
     lastK[channelIndex] = k;
+  } else if (ENABLE_RS485_DEBUG) {
+    Serial.print("[rs485]");
+    Serial.print(channelName);
+    Serial.print(" npk-read-failed addr=");
+    Serial.println(addr);
   }
 }
 
@@ -285,8 +426,26 @@ void sendTelemetryFrame() {
   float n2 = lastN[1];
   float p2 = lastP[1];
   float k2 = lastK[1];
-  readNpkFromChannel(0, rs485Serial1, RS485_1_DE_RE_PIN, n1, p1, k1);
-  readNpkFromChannel(1, rs485Serial2, RS485_2_DE_RE_PIN, n2, p2, k2);
+  if (ENABLE_RS485_CH1_READ) {
+    readNpkFromChannel(0,
+                       rs485Serial1,
+                       RS485_1_DE_RE_PIN,
+                       "ch1",
+                       rs485AddrCh1,
+                       n1,
+                       p1,
+                       k1);
+  }
+  if (ENABLE_RS485_CH2_READ) {
+    readNpkFromChannel(1,
+                       rs485Serial2,
+                       RS485_2_DE_RE_PIN,
+                       "ch2",
+                       rs485AddrCh2,
+                       n2,
+                       p2,
+                       k2);
+  }
 
   // AVR printf does not include float formatting by default.
   // Convert to scaled integers for stable CSV output.
@@ -404,8 +563,8 @@ void serviceEspLink() {
 void setup() {
   Serial.begin(USB_BAUD);
   espLink.begin(ESP_LINK_BAUD);
-  rs485Serial1.begin(RS485_BAUD);
-  rs485Serial2.begin(RS485_BAUD);
+  rs485Serial1.begin(rs485BaudCh1);
+  rs485Serial2.begin(rs485BaudCh2);
 
   pinMode(MOISTURE_1_PIN, INPUT);
   pinMode(MOISTURE_2_PIN, INPUT);
@@ -424,7 +583,31 @@ void setup() {
 
   initDs18b20();
 
+  if (ENABLE_RS485_1_AUTODETECT) {
+    if (autodetectRs485Channel(rs485Serial1,
+                               RS485_1_DE_RE_PIN,
+                               "ch1",
+                               rs485BaudCh1,
+                               rs485AddrCh1)) {
+      rs485Serial1.begin(rs485BaudCh1);
+    } else {
+      rs485BaudCh1 = RS485_1_BAUD_DEFAULT;
+      rs485AddrCh1 = RS485_1_SENSOR_ADDR;
+      rs485Serial1.begin(rs485BaudCh1);
+    }
+  }
+
+  rs485Serial2.begin(rs485BaudCh2);
+
   delay(200);
+  Serial.print("[uno] rs485 ch1 addr=");
+  Serial.print(rs485AddrCh1);
+  Serial.print(" baud=");
+  Serial.println(rs485BaudCh1);
+  Serial.print("[uno] rs485 ch2 addr=");
+  Serial.print(rs485AddrCh2);
+  Serial.print(" baud=");
+  Serial.println(rs485BaudCh2);
   Serial.println("[uno] sensor bridge ready");
 }
 

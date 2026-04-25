@@ -147,6 +147,22 @@ enum AppThemePreference { system, light, dark }
 
 enum ConnectionHealth { online, recovering, offline }
 
+class ManualPumpControl {
+  const ManualPumpControl({required this.id, required this.label});
+
+  final String id;
+  final String label;
+}
+
+const List<ManualPumpControl> kManualPumpControls = [
+  ManualPumpControl(id: 'zone1Water1', label: 'Zone 1 Water 1'),
+  ManualPumpControl(id: 'zone1Water2', label: 'Zone 1 Water 2'),
+  ManualPumpControl(id: 'zone1Nutrient', label: 'Zone 1 Nutrient'),
+  ManualPumpControl(id: 'zone2Water1', label: 'Zone 2 Water 1'),
+  ManualPumpControl(id: 'zone2Water2', label: 'Zone 2 Water 2'),
+  ManualPumpControl(id: 'zone2Nutrient', label: 'Zone 2 Nutrient'),
+];
+
 class AppThemeStore {
   static const _themeKey = 'app_theme_preference_v1';
 
@@ -249,15 +265,17 @@ List<ManualStep> manualGuideSteps() => const [
     troubleshooting: 'If readings stop, check device power and Wi-Fi.',
   ),
   ManualStep(
-    id: 'manual_pumps',
-    title: 'Manual watering',
-    goal: 'Run a short pump pulse when needed.',
+    id: 'automation',
+    title: 'Automation status',
+    goal: 'Understand what the controller can do from the app.',
     actions: [
-      'Open manual control cards.',
-      'Tap Run pulse on the needed pump.',
+      'Use Overview for cycle phase, tank level, and latest warnings.',
+      'Use Device tab to check current valve state and connectivity.',
     ],
-    expected: 'Pump starts briefly and then auto-stops.',
-    troubleshooting: 'If blocked, check tank level, cooldown, or active cycle.',
+    expected:
+        'You can monitor live automation decisions and controller health.',
+    troubleshooting:
+        'If readings look stale, refresh and verify controller Wi-Fi.',
   ),
 ];
 
@@ -458,10 +476,7 @@ class _VertiFarmAppState extends State<VertiFarmApp> {
           brightness: Brightness.light,
         ),
         scaffoldBackgroundColor: const Color(0xFFF3F6F2),
-        cardTheme: const CardThemeData(
-          elevation: 0,
-          margin: EdgeInsets.zero,
-        ),
+        cardTheme: const CardThemeData(elevation: 0, margin: EdgeInsets.zero),
         appBarTheme: const AppBarTheme(backgroundColor: Color(0xFFF3F6F2)),
         useMaterial3: true,
       ),
@@ -471,10 +486,7 @@ class _VertiFarmAppState extends State<VertiFarmApp> {
           brightness: Brightness.dark,
         ),
         scaffoldBackgroundColor: const Color(0xFF111915),
-        cardTheme: const CardThemeData(
-          elevation: 0,
-          margin: EdgeInsets.zero,
-        ),
+        cardTheme: const CardThemeData(elevation: 0, margin: EdgeInsets.zero),
         appBarTheme: const AppBarTheme(backgroundColor: Color(0xFF111915)),
         useMaterial3: true,
       ),
@@ -724,20 +736,19 @@ class DeviceApi {
     return _getJson(host, '/api/status');
   }
 
-  Future<Map<String, dynamic>> triggerManualPump({
-    required String host,
-    required String pumpId,
-    int? durationMs,
-  }) {
-    final body = <String, dynamic>{'pumpId': pumpId};
-    if (durationMs != null) {
-      body['durationMs'] = durationMs;
-    }
-    return _postJson(host, '/api/manual/pump', body);
-  }
-
   Future<Map<String, dynamic>> resetWifi(String host) {
     return _postJson(host, '/api/device/reset-wifi', {'confirm': true});
+  }
+
+  Future<Map<String, dynamic>> runManualPump({
+    required String host,
+    required String pumpId,
+    required int durationMs,
+  }) {
+    return _postJson(host, '/api/manual/pump', {
+      'pumpId': pumpId,
+      'durationMs': durationMs,
+    });
   }
 }
 
@@ -1000,10 +1011,10 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                    Text(
-                      'Start setup',
-                      style: Theme.of(context).textTheme.titleMedium,
-                    ),
+                  Text(
+                    'Start setup',
+                    style: Theme.of(context).textTheme.titleMedium,
+                  ),
                   const SizedBox(height: 12),
                   FilledButton.icon(
                     onPressed: _openScanner,
@@ -1314,7 +1325,9 @@ class _ProvisioningScreenState extends State<ProvisioningScreen> {
       }
       if (state == 'failed') {
         throw ApiException(
-          friendlyApiMessage((result['reason'] ?? 'Connection failed') as String),
+          friendlyApiMessage(
+            (result['reason'] ?? 'Connection failed') as String,
+          ),
         );
       }
     }
@@ -1603,9 +1616,12 @@ class _DashboardScreenState extends State<DashboardScreen>
   bool _offlineNotificationShown = false;
   bool _discoveringDevice = false;
   DateTime? _lastDiscoveryAttemptAt;
-  final Set<String> _manualPendingPumpIds = <String>{};
   int _manualCurrentStep = 0;
   Set<String> _manualDoneSteps = <String>{};
+  bool _manualPumpRequestInFlight = false;
+  String? _manualPumpInFlightId;
+
+  static const int _manualPumpDurationMs = 5000;
 
   String get _host => widget.device.lastKnownIp;
 
@@ -1624,7 +1640,9 @@ class _DashboardScreenState extends State<DashboardScreen>
   }
 
   Future<void> _loadManualProgress() async {
-    final current = await ManualGuideStore.loadCurrentStep(widget.device.deviceId);
+    final current = await ManualGuideStore.loadCurrentStep(
+      widget.device.deviceId,
+    );
     final done = await ManualGuideStore.loadDoneSteps(widget.device.deviceId);
     if (!mounted) {
       return;
@@ -1668,7 +1686,7 @@ class _DashboardScreenState extends State<DashboardScreen>
       builder: (context) => AlertDialog(
         title: const Text('Need a quick tour?'),
         content: const Text(
-          'We can guide you through setup, readings, and manual watering in a few short steps.',
+          'We can guide you through setup, readings, and automation status in a few short steps.',
         ),
         actions: [
           TextButton(
@@ -1907,34 +1925,30 @@ class _DashboardScreenState extends State<DashboardScreen>
     }
   }
 
-  Future<void> _triggerManualPump(String pumpId) async {
-    if (_manualPendingPumpIds.contains(pumpId)) {
+  Future<void> _runManualPump(String pumpId) async {
+    if (_manualPumpRequestInFlight) {
       return;
     }
 
-    if (mounted) {
-      setState(() {
-        _manualPendingPumpIds.add(pumpId);
-      });
-    }
+    setState(() {
+      _manualPumpRequestInFlight = true;
+      _manualPumpInFlightId = pumpId;
+    });
 
     try {
-      final response = await _api.triggerManualPump(
+      await _api.runManualPump(
         host: _host,
         pumpId: pumpId,
-        durationMs: 6000,
+        durationMs: _manualPumpDurationMs,
       );
       if (!mounted) {
         return;
       }
-
-      final durationMs = response['durationMs'];
-      final durationText = durationMs is num
-          ? '${(durationMs / 1000).toStringAsFixed(1)}s'
-          : 'default duration';
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text('Manual pump $pumpId started for $durationText.'),
+          content: Text(
+            'Started ${_manualPumpLabelFromId(pumpId)} for ${(_manualPumpDurationMs / 1000).toStringAsFixed(0)}s.',
+          ),
         ),
       );
       await _refresh(silent: true);
@@ -1954,7 +1968,8 @@ class _DashboardScreenState extends State<DashboardScreen>
     } finally {
       if (mounted) {
         setState(() {
-          _manualPendingPumpIds.remove(pumpId);
+          _manualPumpRequestInFlight = false;
+          _manualPumpInFlightId = null;
         });
       }
     }
@@ -1991,10 +2006,21 @@ class _DashboardScreenState extends State<DashboardScreen>
               fontWeight: FontWeight.w500,
             ),
             tabs: const [
-              Tab(child: FittedBox(fit: BoxFit.scaleDown, child: Text('Overview'))),
-              Tab(child: FittedBox(fit: BoxFit.scaleDown, child: Text('Zones'))),
-              Tab(child: FittedBox(fit: BoxFit.scaleDown, child: Text('Device'))),
-              Tab(child: FittedBox(fit: BoxFit.scaleDown, child: Text('Help'))),
+              Tab(
+                child: FittedBox(
+                  fit: BoxFit.scaleDown,
+                  child: Text('Overview'),
+                ),
+              ),
+              Tab(
+                child: FittedBox(fit: BoxFit.scaleDown, child: Text('Zones')),
+              ),
+              Tab(
+                child: FittedBox(fit: BoxFit.scaleDown, child: Text('Device')),
+              ),
+              Tab(
+                child: FittedBox(fit: BoxFit.scaleDown, child: Text('Help')),
+              ),
             ],
           ),
 
@@ -2037,28 +2063,28 @@ class _DashboardScreenState extends State<DashboardScreen>
                   _OverviewTab(
                     status: status,
                     histories: _zoneHistory,
-                    onManualPumpTrigger: _triggerManualPump,
-                    manualPendingPumpIds: _manualPendingPumpIds,
+                    onRunManualPump: _runManualPump,
+                    manualPumpRequestInFlight: _manualPumpRequestInFlight,
+                    manualPumpInFlightId: _manualPumpInFlightId,
+                    manualPumpDurationMs: _manualPumpDurationMs,
                   ),
                   _ZonesTab(zones: zones, histories: _zoneHistory),
-                    _DeviceTab(
-                      device: widget.device,
-                      info: _info,
-                      status: status,
-                      onResetWifi: _resetWifi,
-                      onManualPumpTrigger: _triggerManualPump,
-                      manualPendingPumpIds: _manualPendingPumpIds,
-                    ),
-                    _HelpTab(
-                      deviceId: widget.device.deviceId,
-                      currentStep: _manualCurrentStep,
-                      doneSteps: _manualDoneSteps,
-                      onContinueGuide: () => _openGuide(),
-                      onRestartGuide: () => _openGuide(reset: true),
-                    ),
-                  ],
-                ),
+                  _DeviceTab(
+                    device: widget.device,
+                    info: _info,
+                    status: status,
+                    onResetWifi: _resetWifi,
+                  ),
+                  _HelpTab(
+                    deviceId: widget.device.deviceId,
+                    currentStep: _manualCurrentStep,
+                    doneSteps: _manualDoneSteps,
+                    onContinueGuide: () => _openGuide(),
+                    onRestartGuide: () => _openGuide(reset: true),
+                  ),
+                ],
               ),
+            ),
           ],
         ),
       ),
@@ -2070,14 +2096,18 @@ class _OverviewTab extends StatelessWidget {
   const _OverviewTab({
     required this.status,
     required this.histories,
-    required this.onManualPumpTrigger,
-    required this.manualPendingPumpIds,
+    required this.onRunManualPump,
+    required this.manualPumpRequestInFlight,
+    required this.manualPumpInFlightId,
+    required this.manualPumpDurationMs,
   });
 
   final Map<String, dynamic>? status;
   final Map<int, _ZoneHistory> histories;
-  final Future<void> Function(String pumpId) onManualPumpTrigger;
-  final Set<String> manualPendingPumpIds;
+  final Future<void> Function(String pumpId) onRunManualPump;
+  final bool manualPumpRequestInFlight;
+  final String? manualPumpInFlightId;
+  final int manualPumpDurationMs;
 
   @override
   Widget build(BuildContext context) {
@@ -2098,6 +2128,10 @@ class _OverviewTab extends StatelessWidget {
       (data['tankLow'] ?? false) == true,
     );
     final sampleAge = _sampleAgeText(data['sampleAgeMs']);
+    final manualPumpStates =
+        ((data['manual'] as Map<String, dynamic>?)?['pumps']
+            as Map<String, dynamic>?) ??
+        const <String, dynamic>{};
     final moistureTrend = _combineSeries(
       histories[1]?.moisture ?? const <double>[],
       histories[2]?.moisture ?? const <double>[],
@@ -2106,23 +2140,6 @@ class _OverviewTab extends StatelessWidget {
       histories[1]?.temperature ?? const <double>[],
       histories[2]?.temperature ?? const <double>[],
     );
-    final manual =
-        (data['manual'] as Map<String, dynamic>?) ?? const <String, dynamic>{};
-    final manualPumps =
-        (manual['pumps'] as List<dynamic>?) ?? const <dynamic>[];
-
-    Map<String, dynamic>? manualPumpById(String id) {
-      for (final entry in manualPumps) {
-        if (entry is! Map<String, dynamic>) {
-          continue;
-        }
-        if ('${entry['pumpId'] ?? ''}' == id) {
-          return entry;
-        }
-      }
-      return null;
-    }
-
     return ListView(
       padding: const EdgeInsets.all(16),
       children: [
@@ -2219,7 +2236,9 @@ class _OverviewTab extends StatelessWidget {
               const SizedBox(height: 10),
               Text(
                 'Current phase time left: ${_phaseRemainingText(data)}',
-                style: TextStyle(color: Theme.of(context).colorScheme.onSurfaceVariant),
+                style: TextStyle(
+                  color: Theme.of(context).colorScheme.onSurfaceVariant,
+                ),
               ),
             ],
           ),
@@ -2353,75 +2372,89 @@ class _OverviewTab extends StatelessWidget {
                   ),
                 ],
               ),
-              const SizedBox(height: 12),
-              const _SectionHeader(
-                title: 'Manual watering',
-                subtitle: 'Tap a pump to run a timed watering pulse',
+              const SizedBox(height: 16),
+              Text(
+                'Manual Controls',
+                style: Theme.of(
+                  context,
+                ).textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w700),
+              ),
+              const SizedBox(height: 4),
+              Text(
+                'Tap a tile to run one pump for ${(manualPumpDurationMs / 1000).toStringAsFixed(0)} seconds.',
+                style: TextStyle(
+                  color: Theme.of(context).colorScheme.onSurfaceVariant,
+                ),
               ),
               const SizedBox(height: 12),
               LayoutBuilder(
                 builder: (context, constraints) {
-                  final twoColumns = constraints.maxWidth >= 460;
-                  final children = [
-                    _ManualPumpCard(
-                      title: 'Zone 1 Pump A',
-                      pumpId: 'z1a',
-                      pumpState: manualPumpById('z1a'),
-                      isPending: manualPendingPumpIds.contains('z1a'),
-                      onTrigger: onManualPumpTrigger,
-                    ),
-                    _ManualPumpCard(
-                      title: 'Zone 1 Pump B',
-                      pumpId: 'z1b',
-                      pumpState: manualPumpById('z1b'),
-                      isPending: manualPendingPumpIds.contains('z1b'),
-                      onTrigger: onManualPumpTrigger,
-                    ),
-                    _ManualPumpCard(
-                      title: 'Zone 2 Pump A',
-                      pumpId: 'z2a',
-                      pumpState: manualPumpById('z2a'),
-                      isPending: manualPendingPumpIds.contains('z2a'),
-                      onTrigger: onManualPumpTrigger,
-                    ),
-                    _ManualPumpCard(
-                      title: 'Zone 2 Pump B',
-                      pumpId: 'z2b',
-                      pumpState: manualPumpById('z2b'),
-                      isPending: manualPendingPumpIds.contains('z2b'),
-                      onTrigger: onManualPumpTrigger,
-                    ),
-                  ];
+                  final spacing = 12.0;
+                  final columns = constraints.maxWidth < 360
+                      ? 1
+                      : (constraints.maxWidth < 620 ? 2 : 3);
+                  final tileWidth =
+                      (constraints.maxWidth - (columns - 1) * spacing) /
+                      columns;
+                  final zone1Controls = kManualPumpControls
+                      .where((control) => control.id.startsWith('zone1'))
+                      .toList(growable: false);
+                  final zone2Controls = kManualPumpControls
+                      .where((control) => control.id.startsWith('zone2'))
+                      .toList(growable: false);
 
-                  if (!twoColumns) {
+                  Widget buildZoneGrid(
+                    String zoneTitle,
+                    List<ManualPumpControl> controls,
+                  ) {
                     return Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        for (int i = 0; i < children.length; i++) ...[
-                          children[i],
-                          if (i < children.length - 1)
-                            const SizedBox(height: 10),
-                        ],
+                        Text(
+                          zoneTitle,
+                          style: Theme.of(context).textTheme.titleMedium
+                              ?.copyWith(fontWeight: FontWeight.w700),
+                        ),
+                        const SizedBox(height: 10),
+                        Wrap(
+                          spacing: spacing,
+                          runSpacing: spacing,
+                          children: [
+                            for (final control in controls)
+                              SizedBox(
+                                width: tileWidth,
+                                child: () {
+                                  final state =
+                                      '${manualPumpStates[control.id] ?? 'unknown'}';
+                                  final onPressed =
+                                      manualPumpRequestInFlight ||
+                                          !_manualPumpCanRun(state)
+                                      ? null
+                                      : () => unawaited(
+                                          onRunManualPump(control.id),
+                                        );
+                                  return _ManualPumpButtonTile(
+                                    label: _manualPumpShortLabel(control.id),
+                                    state: state,
+                                    isSubmitting:
+                                        manualPumpRequestInFlight &&
+                                        manualPumpInFlightId == control.id,
+                                    onPressed: onPressed,
+                                  );
+                                }(),
+                              ),
+                          ],
+                        ),
                       ],
                     );
                   }
 
                   return Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Row(
-                        children: [
-                          Expanded(child: children[0]),
-                          const SizedBox(width: 10),
-                          Expanded(child: children[1]),
-                        ],
-                      ),
-                      const SizedBox(height: 10),
-                      Row(
-                        children: [
-                          Expanded(child: children[2]),
-                          const SizedBox(width: 10),
-                          Expanded(child: children[3]),
-                        ],
-                      ),
+                      buildZoneGrid('Zone 1', zone1Controls),
+                      const SizedBox(height: 14),
+                      buildZoneGrid('Zone 2', zone2Controls),
                     ],
                   );
                 },
@@ -2600,43 +2633,22 @@ class _DeviceTab extends StatelessWidget {
     required this.info,
     required this.status,
     required this.onResetWifi,
-    required this.onManualPumpTrigger,
-    required this.manualPendingPumpIds,
   });
 
   final DeviceRecord device;
   final Map<String, dynamic>? info;
   final Map<String, dynamic>? status;
   final Future<void> Function() onResetWifi;
-  final Future<void> Function(String pumpId) onManualPumpTrigger;
-  final Set<String> manualPendingPumpIds;
 
   @override
   Widget build(BuildContext context) {
     final wifi =
         (status?['wifi'] as Map<String, dynamic>?) ?? const <String, dynamic>{};
-    final telemetrySource = '${status?['telemetrySource'] ?? 'esp32_local'}';
-    final unoTelemetryAgeMs =
-        (status?['unoTelemetryAgeMs'] as num?)?.toInt() ?? 0;
-    final unoTelemetrySeq = (status?['unoTelemetrySeq'] as num?)?.toInt() ?? 0;
-    final unoTelemetryFresh = (status?['unoTelemetryFresh'] ?? false) == true;
-    final manual =
-        (status?['manual'] as Map<String, dynamic>?) ??
-        const <String, dynamic>{};
-    final manualPumps =
-        (manual['pumps'] as List<dynamic>?) ?? const <dynamic>[];
-
-    Map<String, dynamic>? manualPumpById(String id) {
-      for (final entry in manualPumps) {
-        if (entry is! Map<String, dynamic>) {
-          continue;
-        }
-        if ('${entry['pumpId'] ?? ''}' == id) {
-          return entry;
-        }
-      }
-      return null;
-    }
+    final sampleAgeMs = (status?['sampleAgeMs'] as num?)?.toInt() ?? 0;
+    final lastTelemetrySampleAtMs =
+        (status?['lastTelemetrySampleAtMs'] as num?)?.toInt() ?? 0;
+    final phaseRemainingMs =
+        (status?['phaseRemainingMs'] as num?)?.toInt() ?? 0;
 
     return ListView(
       padding: const EdgeInsets.all(16),
@@ -2707,104 +2719,29 @@ class _DeviceTab extends StatelessWidget {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 const _SectionHeader(
-                  title: 'Serial link diagnostics',
-                  subtitle: 'UNO telemetry freshness and link health',
+                  title: 'Telemetry diagnostics',
+                  subtitle:
+                      'Current freshness and cycle timing from /api/status',
                 ),
                 const SizedBox(height: 12),
-                _DetailRow(label: 'Telemetry source', value: telemetrySource),
                 _DetailRow(
-                  label: 'Uno telemetry fresh',
-                  value: unoTelemetryFresh ? 'Yes' : 'No',
+                  label: 'Sample age',
+                  value: '${(sampleAgeMs / 1000).toStringAsFixed(1)} s',
                 ),
                 _DetailRow(
-                  label: 'Uno telemetry age',
-                  value: '${(unoTelemetryAgeMs / 1000).toStringAsFixed(1)} s',
+                  label: 'Last telemetry timestamp',
+                  value:
+                      '${(lastTelemetrySampleAtMs / 1000).toStringAsFixed(1)} s uptime',
                 ),
-                _DetailRow(label: 'Uno frame seq', value: '$unoTelemetrySeq'),
+                _DetailRow(
+                  label: 'Phase remaining',
+                  value: '${(phaseRemainingMs / 1000).toStringAsFixed(1)} s',
+                ),
               ],
             ),
           ),
         ),
         const SizedBox(height: 16),
-        _SectionCard(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const _SectionHeader(
-                title: 'Manual control',
-                subtitle: 'Timed manual pump pulses from the mobile app',
-              ),
-              const SizedBox(height: 12),
-              LayoutBuilder(
-                builder: (context, constraints) {
-                  final twoColumns = constraints.maxWidth >= 460;
-                  final children = [
-                    _ManualPumpCard(
-                      title: 'Zone 1 Pump A',
-                      pumpId: 'z1a',
-                      pumpState: manualPumpById('z1a'),
-                      isPending: manualPendingPumpIds.contains('z1a'),
-                      onTrigger: onManualPumpTrigger,
-                    ),
-                    _ManualPumpCard(
-                      title: 'Zone 1 Pump B',
-                      pumpId: 'z1b',
-                      pumpState: manualPumpById('z1b'),
-                      isPending: manualPendingPumpIds.contains('z1b'),
-                      onTrigger: onManualPumpTrigger,
-                    ),
-                    _ManualPumpCard(
-                      title: 'Zone 2 Pump A',
-                      pumpId: 'z2a',
-                      pumpState: manualPumpById('z2a'),
-                      isPending: manualPendingPumpIds.contains('z2a'),
-                      onTrigger: onManualPumpTrigger,
-                    ),
-                    _ManualPumpCard(
-                      title: 'Zone 2 Pump B',
-                      pumpId: 'z2b',
-                      pumpState: manualPumpById('z2b'),
-                      isPending: manualPendingPumpIds.contains('z2b'),
-                      onTrigger: onManualPumpTrigger,
-                    ),
-                  ];
-
-                  if (!twoColumns) {
-                    return Column(
-                      children: [
-                        for (int i = 0; i < children.length; i++) ...[
-                          children[i],
-                          if (i < children.length - 1)
-                            const SizedBox(height: 10),
-                        ],
-                      ],
-                    );
-                  }
-
-                  return Column(
-                    children: [
-                      Row(
-                        children: [
-                          Expanded(child: children[0]),
-                          const SizedBox(width: 10),
-                          Expanded(child: children[1]),
-                        ],
-                      ),
-                      const SizedBox(height: 10),
-                      Row(
-                        children: [
-                          Expanded(child: children[2]),
-                          const SizedBox(width: 10),
-                          Expanded(child: children[3]),
-                        ],
-                      ),
-                    ],
-                  );
-                },
-              ),
-            ],
-          ),
-        ),
         const SizedBox(height: 16),
         _SectionCard(
           child: Column(
@@ -3072,7 +3009,9 @@ class _ManualGuideScreenState extends State<ManualGuideScreen> {
                   width: double.infinity,
                   child: FilledButton(
                     onPressed: _next,
-                    child: Text(_index == _steps.length - 1 ? 'Finish' : 'Next'),
+                    child: Text(
+                      _index == _steps.length - 1 ? 'Finish' : 'Next',
+                    ),
                   ),
                 ),
               ],
@@ -3097,7 +3036,9 @@ class _ManualGuideScreenState extends State<ManualGuideScreen> {
                 Expanded(
                   child: FilledButton(
                     onPressed: _next,
-                    child: Text(_index == _steps.length - 1 ? 'Finish' : 'Next'),
+                    child: Text(
+                      _index == _steps.length - 1 ? 'Finish' : 'Next',
+                    ),
                   ),
                 ),
               ],
@@ -3185,9 +3126,7 @@ class _HeroCard extends StatelessWidget {
                 children: [
                   Text(
                     title,
-                    style: Theme.of(
-                      context,
-                    ).textTheme.titleLarge?.copyWith(
+                    style: Theme.of(context).textTheme.titleLarge?.copyWith(
                       color: scheme.onPrimaryContainer,
                     ),
                   ),
@@ -3379,11 +3318,7 @@ class _SectionCard extends StatelessWidget {
         color: cardColor,
         borderRadius: BorderRadius.circular(24),
         boxShadow: [
-          BoxShadow(
-            color: shadowColor,
-            blurRadius: 18,
-            offset: Offset(0, 8),
-          ),
+          BoxShadow(color: shadowColor, blurRadius: 18, offset: Offset(0, 8)),
         ],
       ),
       child: Padding(padding: padding, child: child),
@@ -3474,7 +3409,9 @@ class _ProgressStrip extends StatelessWidget {
   Widget build(BuildContext context) {
     final clamped = value.clamp(0, 1).toDouble();
     final scheme = Theme.of(context).colorScheme;
-    final labelColor = lightOnDark ? const Color(0xFFD9ECE2) : scheme.onSurfaceVariant;
+    final labelColor = lightOnDark
+        ? const Color(0xFFD9ECE2)
+        : scheme.onSurfaceVariant;
     final valueColor = lightOnDark ? Colors.white : scheme.onSurface;
     final backgroundColor = lightOnDark
         ? const Color(0x1FFFFFFF)
@@ -3485,17 +3422,11 @@ class _ProgressStrip extends StatelessWidget {
         Row(
           children: [
             Expanded(
-              child: Text(
-                label,
-                style: TextStyle(color: labelColor),
-              ),
+              child: Text(label, style: TextStyle(color: labelColor)),
             ),
             Text(
               valueText,
-              style: TextStyle(
-                color: valueColor,
-                fontWeight: FontWeight.w700,
-              ),
+              style: TextStyle(color: valueColor, fontWeight: FontWeight.w700),
             ),
           ],
         ),
@@ -3549,76 +3480,91 @@ class _SummaryStatCard extends StatelessWidget {
   }
 }
 
-class _ManualPumpCard extends StatelessWidget {
-  const _ManualPumpCard({
-    required this.title,
-    required this.pumpId,
-    required this.pumpState,
-    required this.isPending,
-    required this.onTrigger,
+class _ManualPumpButtonTile extends StatelessWidget {
+  const _ManualPumpButtonTile({
+    required this.label,
+    required this.state,
+    required this.isSubmitting,
+    required this.onPressed,
   });
 
-  final String title;
-  final String pumpId;
-  final Map<String, dynamic>? pumpState;
-  final bool isPending;
-  final Future<void> Function(String pumpId) onTrigger;
+  final String label;
+  final String state;
+  final bool isSubmitting;
+  final VoidCallback? onPressed;
 
   @override
   Widget build(BuildContext context) {
+    final dark = Theme.of(context).brightness == Brightness.dark;
     final scheme = Theme.of(context).colorScheme;
-    final configured = (pumpState?['configured'] ?? false) == true;
-    final active = (pumpState?['active'] ?? false) == true;
-    final runningRemainingMs =
-        ((pumpState?['runningRemainingMs'] as num?)?.toInt() ?? 0).clamp(
-          0,
-          999999,
-        );
-    final cooldownRemainingMs =
-        ((pumpState?['cooldownRemainingMs'] as num?)?.toInt() ?? 0).clamp(
-          0,
-          999999,
-        );
+    final stateColor = _manualPumpStateColor(state);
+    final isEnabled = onPressed != null && _manualPumpCanRun(state);
+    final tileBackground = dark
+        ? const Color(0xFF223028)
+        : const Color(0xFFE4EAE6);
+    final labelColor = dark ? scheme.onSurface : const Color(0xFF1B2B21);
 
-    final cooldownSeconds = (cooldownRemainingMs / 1000).ceil();
-    final runningSeconds = (runningRemainingMs / 1000).ceil();
-
-    String status = 'Ready';
-    if (!configured) {
-      status = 'Not wired';
-    } else if (isPending) {
-      status = 'Starting...';
-    } else if (active) {
-      status = 'Running ${runningSeconds}s';
-    } else if (cooldownRemainingMs > 0) {
-      status = 'Cooldown ${cooldownSeconds}s';
-    }
-
-    final canRun =
-        configured && !active && cooldownRemainingMs == 0 && !isPending;
-
-    return _SectionCard(
-      padding: const EdgeInsets.all(12),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(title, style: TextStyle(color: scheme.onSurfaceVariant)),
-          const SizedBox(height: 8),
-          Text(
-            status,
-            style: Theme.of(
-              context,
-            ).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700),
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        borderRadius: BorderRadius.circular(14),
+        onTap: isEnabled ? onPressed : null,
+        child: Container(
+          height: 104,
+          decoration: BoxDecoration(
+            color: tileBackground,
+            borderRadius: BorderRadius.circular(14),
+            border: Border.all(color: stateColor.withValues(alpha: 0.85)),
           ),
-          const SizedBox(height: 8),
-          SizedBox(
-            width: double.infinity,
-            child: FilledButton.tonal(
-              onPressed: canRun ? () => unawaited(onTrigger(pumpId)) : null,
-              child: Text(canRun ? 'Run 6s pulse' : 'Unavailable'),
-            ),
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+          child: Column(
+            children: [
+              SizedBox(
+                height: 22,
+                child: Center(
+                  child: isSubmitting
+                      ? SizedBox(
+                          width: 16,
+                          height: 16,
+                          child: CircularProgressIndicator(
+                            strokeWidth: 2,
+                            valueColor: AlwaysStoppedAnimation<Color>(
+                              stateColor,
+                            ),
+                          ),
+                        )
+                      : Icon(
+                          _manualPumpStateIcon(state),
+                          color: stateColor,
+                          size: 18,
+                        ),
+                ),
+              ),
+              const SizedBox(height: 2),
+              Expanded(
+                child: Center(
+                  child: Text(
+                    label,
+                    textAlign: TextAlign.center,
+                    maxLines: 2,
+                    style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                      fontWeight: FontWeight.w500,
+                      color: labelColor,
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 2),
+              Text(
+                _manualPumpStateLabel(state),
+                style: TextStyle(
+                  color: stateColor,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+            ],
           ),
-        ],
+        ),
       ),
     );
   }
@@ -3869,11 +3815,7 @@ class _ZoneHistory {
   final List<double> temperature = <double>[];
   final List<double> nutrient = <double>[];
 
-  void addSample({
-    double? moisture,
-    double? temperature,
-    double? nutrient,
-  }) {
+  void addSample({double? moisture, double? temperature, double? nutrient}) {
     _push(this.moisture, moisture);
     _push(this.temperature, temperature);
     _push(this.nutrient, nutrient);
@@ -4053,6 +3995,80 @@ List<double> _combineSeries(List<double> a, List<double> b) {
     }
   }
   return out;
+}
+
+String _manualPumpLabelFromId(String pumpId) {
+  for (final control in kManualPumpControls) {
+    if (control.id == pumpId) {
+      return control.label;
+    }
+  }
+  return pumpId;
+}
+
+String _manualPumpShortLabel(String pumpId) {
+  switch (pumpId) {
+    case 'zone1Water1':
+    case 'zone2Water1':
+      return 'Water 1';
+    case 'zone1Water2':
+    case 'zone2Water2':
+      return 'Water 2';
+    case 'zone1Nutrient':
+    case 'zone2Nutrient':
+      return 'Nutrient';
+    default:
+      return _manualPumpLabelFromId(pumpId);
+  }
+}
+
+bool _manualPumpCanRun(String state) {
+  return state.toLowerCase() == 'ready';
+}
+
+String _manualPumpStateLabel(String state) {
+  switch (state.toLowerCase()) {
+    case 'ready':
+      return 'Ready';
+    case 'running':
+      return 'Running';
+    case 'cooldown':
+      return 'Cooldown';
+    case 'unavailable':
+      return 'Unavailable';
+    default:
+      return 'Unknown';
+  }
+}
+
+Color _manualPumpStateColor(String state) {
+  switch (state.toLowerCase()) {
+    case 'ready':
+      return const Color(0xFF2F8F62);
+    case 'running':
+      return const Color(0xFF3B82F6);
+    case 'cooldown':
+      return const Color(0xFFF59E0B);
+    case 'unavailable':
+      return const Color(0xFFDC2626);
+    default:
+      return const Color(0xFF64748B);
+  }
+}
+
+IconData _manualPumpStateIcon(String state) {
+  switch (state.toLowerCase()) {
+    case 'ready':
+      return Icons.check;
+    case 'running':
+      return Icons.play_arrow;
+    case 'cooldown':
+      return Icons.timelapse;
+    case 'unavailable':
+      return Icons.block;
+    default:
+      return Icons.help_outline;
+  }
 }
 
 Color _bandColor(String band) {
