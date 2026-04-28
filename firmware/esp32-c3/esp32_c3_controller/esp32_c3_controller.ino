@@ -3437,6 +3437,25 @@ bool parseUnoTelemetryFrame(const char *line, ZoneReadings *outReadings, float &
     values[i] = (int32_t)parsed;
   }
 
+  uint8_t humidityTokenCount = 0;
+  int32_t humidityValues[2] = {0, 0};
+  for (uint8_t i = 0; i < 2; i++)
+  {
+    char *token = strtok_r(nullptr, ",", &ctx);
+    if (token == nullptr)
+    {
+      break;
+    }
+    char *end = nullptr;
+    long parsed = strtol(token, &end, 10);
+    if (end == token || *end != '\0')
+    {
+      return false;
+    }
+    humidityValues[i] = (int32_t)parsed;
+    humidityTokenCount++;
+  }
+
   outReadings[0].moisturePct = (float)values[0] / 10.0f;
   outReadings[1].moisturePct = (float)values[1] / 10.0f;
   outTankDistanceCm = (values[2] >= 0) ? ((float)values[2] / 10.0f) : NAN;
@@ -3451,8 +3470,16 @@ bool parseUnoTelemetryFrame(const char *line, ZoneReadings *outReadings, float &
   outReadings[0].tempC = (float)values[9] / 10.0f;
   outReadings[1].tempC = (float)values[10] / 10.0f;
 
-  outReadings[0].humidityPct = hasLatestReadings[0] ? latestReadings[0].humidityPct : UNO_DEFAULT_HUMIDITY_PCT;
-  outReadings[1].humidityPct = hasLatestReadings[1] ? latestReadings[1].humidityPct : UNO_DEFAULT_HUMIDITY_PCT;
+  if (humidityTokenCount == 2)
+  {
+    outReadings[0].humidityPct = (float)humidityValues[0] / 10.0f;
+    outReadings[1].humidityPct = (float)humidityValues[1] / 10.0f;
+  }
+  else
+  {
+    outReadings[0].humidityPct = hasLatestReadings[0] ? latestReadings[0].humidityPct : UNO_DEFAULT_HUMIDITY_PCT;
+    outReadings[1].humidityPct = hasLatestReadings[1] ? latestReadings[1].humidityPct : UNO_DEFAULT_HUMIDITY_PCT;
+  }
 
   return true;
 }

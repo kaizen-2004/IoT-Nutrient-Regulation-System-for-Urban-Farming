@@ -1,7 +1,6 @@
 #include <Arduino.h>
 #include <SoftwareSerial.h>
-#include <DallasTemperature.h>
-#include <OneWire.h>
+#include <DHT.h>
 
 const uint32_t USB_BAUD = 115200;
 const uint32_t ESP_LINK_BAUD = 19200;
@@ -15,9 +14,11 @@ const uint8_t MOISTURE_2_PIN = A1;
 const int MOISTURE_DRY_RAW = 850;
 const int MOISTURE_WET_RAW = 420;
 
-const uint8_t DS18B20_PIN = 2;
+const uint8_t DHT11_ZONE1_PIN = 2;
+const uint8_t DHT11_ZONE2_PIN = 3;
+const uint8_t DHT11_SENSOR_TYPE = DHT11;
 const float DEFAULT_TEMP_C = 25.0f;
-const bool USE_FIXED_DS18B20_ADDRS = true;
+const float DEFAULT_HUMIDITY_PCT = 60.0f;
 
 const uint8_t TANK_TRIG_PIN = 12;
 const uint8_t TANK_ECHO_PIN = 6;
@@ -50,24 +51,22 @@ const uint32_t RS485_SCAN_BAUDS[] = {4800, 9600, 2400, 19200};
 const uint8_t RS485_ADDR_SCAN_MIN = 1;
 const uint8_t RS485_ADDR_SCAN_MAX = 8;
 
-const bool ENABLE_DS18B20 = true;
+const bool ENABLE_DHT11 = true;
 const bool ENABLE_RS485_NPK = true;
 
 SoftwareSerial espLink(ESP_LINK_RX_PIN, ESP_LINK_TX_PIN);
 SoftwareSerial rs485Serial1(RS485_1_RX_PIN, RS485_1_TX_PIN);
 SoftwareSerial rs485Serial2(RS485_2_RX_PIN, RS485_2_TX_PIN);
 
-OneWire oneWire(DS18B20_PIN);
-DallasTemperature ds18b20(&oneWire);
-DeviceAddress dsAddr1 = {0x28, 0x61, 0x66, 0x36, 0xF3, 0x61, 0x51, 0x54};
-DeviceAddress dsAddr2 = {0x28, 0x21, 0x66, 0x36, 0xF3, 0x47, 0xC9, 0x99};
-bool dsHave1 = false;
-bool dsHave2 = false;
+DHT dhtZone1(DHT11_ZONE1_PIN, DHT11_SENSOR_TYPE);
+DHT dhtZone2(DHT11_ZONE2_PIN, DHT11_SENSOR_TYPE);
 
 uint32_t seqCounter = 0;
 uint32_t lastTelemetryAt = 0;
 float lastTemp1 = DEFAULT_TEMP_C;
 float lastTemp2 = DEFAULT_TEMP_C;
+float lastHumidity1 = DEFAULT_HUMIDITY_PCT;
+float lastHumidity2 = DEFAULT_HUMIDITY_PCT;
 float lastN[2] = {0.0f, 0.0f};
 float lastP[2] = {0.0f, 0.0f};
 float lastK[2] = {0.0f, 0.0f};
@@ -170,53 +169,42 @@ float readTankDistanceCm() {
   return sum / (float)valid;
 }
 
-void initDs18b20() {
-  ds18b20.begin();
-  if (USE_FIXED_DS18B20_ADDRS) {
-    dsHave1 = ds18b20.isConnected(dsAddr1);
-    dsHave2 = ds18b20.isConnected(dsAddr2);
-  } else {
-    int count = ds18b20.getDeviceCount();
-    if (count > 0) {
-      dsHave1 = ds18b20.getAddress(dsAddr1, 0);
-    }
-    if (count > 1) {
-      dsHave2 = ds18b20.getAddress(dsAddr2, 1);
-    }
-  }
-  ds18b20.setWaitForConversion(true);
-
-  Serial.print("[uno] ds18b20 z1=");
-  Serial.println(dsHave1 ? "ok" : "missing");
-  Serial.print("[uno] ds18b20 z2=");
-  Serial.println(dsHave2 ? "ok" : "missing");
+void initDht11() {
+  dhtZone1.begin();
+  dhtZone2.begin();
+  Serial.println("[uno] dht11 z1/z2 initialized");
 }
 
-void readDs18b20Temps(float &temp1, float &temp2) {
+void readDht11TempsHumidity(float &temp1, float &temp2, float &humidity1, float &humidity2) {
   temp1 = lastTemp1;
   temp2 = lastTemp2;
+  humidity1 = lastHumidity1;
+  humidity2 = lastHumidity2;
 
-  if (!ENABLE_DS18B20 || (!dsHave1 && !dsHave2)) {
+  if (!ENABLE_DHT11) {
     return;
   }
 
-  ds18b20.requestTemperatures();
-  if (dsHave1) {
-    float t = ds18b20.getTempC(dsAddr1);
-    if (t > -50.0f && t < 125.0f) {
-      temp1 = t;
-      lastTemp1 = t;
-    }
+  float t1 = dhtZone1.readTemperature();
+  float h1 = dhtZone1.readHumidity();
+  if (isfinite(t1) && t1 > -20.0f && t1 < 80.0f) {
+    temp1 = t1;
+    lastTemp1 = t1;
   }
-  if (dsHave2) {
-    float t = ds18b20.getTempC(dsAddr2);
-    if (t > -50.0f && t < 125.0f) {
-      temp2 = t;
-      lastTemp2 = t;
-    }
-  } else {
-    temp2 = temp1;
-    lastTemp2 = temp2;
+  if (isfinite(h1) && h1 >= 0.0f && h1 <= 100.0f) {
+    humidity1 = h1;
+    lastHumidity1 = h1;
+  }
+
+  float t2 = dhtZone2.readTemperature();
+  float h2 = dhtZone2.readHumidity();
+  if (isfinite(t2) && t2 > -20.0f && t2 < 80.0f) {
+    temp2 = t2;
+    lastTemp2 = t2;
+  }
+  if (isfinite(h2) && h2 >= 0.0f && h2 <= 100.0f) {
+    humidity2 = h2;
+    lastHumidity2 = h2;
   }
 }
 
@@ -418,7 +406,9 @@ void sendTelemetryFrame() {
 
   float t1 = lastTemp1;
   float t2 = lastTemp2;
-  readDs18b20Temps(t1, t2);
+  float h1 = lastHumidity1;
+  float h2 = lastHumidity2;
+  readDht11TempsHumidity(t1, t2, h1, h2);
 
   float n1 = lastN[0];
   float p1 = lastP[0];
@@ -460,11 +450,18 @@ void sendTelemetryFrame() {
   int16_t k2x10 = (int16_t)roundf(k2 * 10.0f);
   int16_t t1x10 = (int16_t)roundf(t1 * 10.0f);
   int16_t t2x10 = (int16_t)roundf(t2 * 10.0f);
+  int16_t h1x10 = (int16_t)roundf(h1 * 10.0f);
+  int16_t h2x10 = (int16_t)roundf(h2 * 10.0f);
 
-  char payload[128];
+  Serial.print("[uno] humidity z1=");
+  Serial.print((float)h1x10 / 10.0f, 1);
+  Serial.print(" z2=");
+  Serial.println((float)h2x10 / 10.0f, 1);
+
+  char payload[152];
   snprintf(payload,
            sizeof(payload),
-           "T,%lu,%lu,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d",
+           "T,%lu,%lu,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d",
            (unsigned long)seqCounter,
            (unsigned long)millis(),
            (int)m1x10,
@@ -477,7 +474,9 @@ void sendTelemetryFrame() {
            (int)p2x10,
            (int)k2x10,
            (int)t1x10,
-           (int)t2x10);
+           (int)t2x10,
+           (int)h1x10,
+           (int)h2x10);
 
   uint8_t crc = xorCrc(payload, strlen(payload));
 
@@ -581,7 +580,7 @@ void setup() {
     rs485SetTx(RS485_2_DE_RE_PIN, false);
   }
 
-  initDs18b20();
+  initDht11();
 
   if (ENABLE_RS485_1_AUTODETECT) {
     if (autodetectRs485Channel(rs485Serial1,

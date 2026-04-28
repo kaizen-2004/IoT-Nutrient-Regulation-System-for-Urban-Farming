@@ -1876,6 +1876,7 @@ class _DashboardScreenState extends State<DashboardScreen>
       history.addSample(
         moisture: _asDouble(entry['soilMoisturePct']),
         temperature: _asDouble(entry['tempC']),
+        humidity: _asDouble(entry['humidityPct']),
         nutrient: _asDouble(entry['nutrientPpm']),
       );
     }
@@ -2120,6 +2121,7 @@ class _OverviewTab extends StatelessWidget {
     final connected = (wifi['connected'] ?? false) == true;
     final avgMoisture = _averageZoneValue(zones, 'soilMoisturePct');
     final avgTemp = _averageZoneValue(zones, 'tempC');
+    final avgHumidity = _averageZoneValue(zones, 'humidityPct');
     final avgNutrient = _averageZoneValue(zones, 'nutrientPpm');
     final phaseProgress = _phaseProgress(data);
     final tankDistance = _asDouble(data['tankDistanceCm']);
@@ -2139,6 +2141,10 @@ class _OverviewTab extends StatelessWidget {
     final tempTrend = _combineSeries(
       histories[1]?.temperature ?? const <double>[],
       histories[2]?.temperature ?? const <double>[],
+    );
+    final humidityTrend = _combineSeries(
+      histories[1]?.humidity ?? const <double>[],
+      histories[2]?.humidity ?? const <double>[],
     );
     return ListView(
       padding: const EdgeInsets.all(16),
@@ -2232,6 +2238,16 @@ class _OverviewTab extends StatelessWidget {
                     : '${avgNutrient.toStringAsFixed(1)} ppm',
                 progress: ((avgNutrient ?? 0) / 1600).clamp(0, 1),
                 color: const Color(0xFF8B5CF6),
+              ),
+              const SizedBox(height: 12),
+              _MetricGauge(
+                label: 'Humidity',
+                value: avgHumidity,
+                display: avgHumidity == null
+                    ? '--'
+                    : '${avgHumidity.toStringAsFixed(1)} %',
+                progress: ((avgHumidity ?? 0) / 100).clamp(0, 1),
+                color: const Color(0xFF3B82F6),
               ),
               const SizedBox(height: 10),
               Text(
@@ -2335,6 +2351,14 @@ class _OverviewTab extends StatelessWidget {
                 series: tempTrend,
                 color: const Color(0xFFF97316),
                 suffix: ' C',
+              ),
+              const SizedBox(height: 12),
+              _MiniChartCard(
+                title: 'Humidity trend',
+                subtitle: 'Average of both zones',
+                series: humidityTrend,
+                color: const Color(0xFF3B82F6),
+                suffix: '%',
               ),
             ],
           ),
@@ -2564,6 +2588,15 @@ class _ZonesTab extends StatelessWidget {
                       .clamp(0, 1),
                   color: const Color(0xFFA855F7),
                 ),
+                const SizedBox(height: 12),
+                _MetricGauge(
+                  label: 'Humidity',
+                  value: _asDouble(zone['humidityPct']),
+                  display: '${zone['humidityPct'] ?? '--'} %',
+                  progress: ((_asDouble(zone['humidityPct']) ?? 0) / 100)
+                      .clamp(0, 1),
+                  color: const Color(0xFF3B82F6),
+                ),
                 const SizedBox(height: 16),
                 _MiniChartCard(
                   title: 'Soil wetness over time',
@@ -2583,6 +2616,16 @@ class _ZonesTab extends StatelessWidget {
                       const <double>[],
                   color: const Color(0xFFF97316),
                   suffix: ' C',
+                ),
+                const SizedBox(height: 12),
+                _MiniChartCard(
+                  title: 'Humidity over time',
+                  subtitle: 'Recent humidity samples',
+                  series:
+                      histories[(zone['zone'] as num?)?.toInt()]?.humidity ??
+                      const <double>[],
+                  color: const Color(0xFF3B82F6),
+                  suffix: '%',
                 ),
                 const SizedBox(height: 16),
                 Container(
@@ -3813,11 +3856,18 @@ class _ZoneHistory {
 
   final List<double> moisture = <double>[];
   final List<double> temperature = <double>[];
+  final List<double> humidity = <double>[];
   final List<double> nutrient = <double>[];
 
-  void addSample({double? moisture, double? temperature, double? nutrient}) {
+  void addSample({
+    double? moisture,
+    double? temperature,
+    double? humidity,
+    double? nutrient,
+  }) {
     _push(this.moisture, moisture);
     _push(this.temperature, temperature);
+    _push(this.humidity, humidity);
     _push(this.nutrient, nutrient);
   }
 

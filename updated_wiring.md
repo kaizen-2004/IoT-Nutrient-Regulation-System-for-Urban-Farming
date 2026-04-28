@@ -1,9 +1,9 @@
 ESP32-C3 (controller side)
 - GPIO6  -> Water pump relay #1
-- GPIO4  -> Water pump relay #2
+- GPIO7  -> Water pump relay #2
 - GPIO3  -> Water pump relay #3
-- GPIO5  -> Water pump relay #4
-- GPIO7  -> Nutrient pump relay #1
+- GPIO4  -> Water pump relay #4
+- GPIO5  -> Nutrient pump relay #1
 - GPIO10 -> Nutrient pump relay #2
 - GPIO1  -> Reset/setup button (hold ~4s to force setup mode)
 - GPIO8 / GPIO9 -> I2C LCD (SDA / SCL)
@@ -21,9 +21,14 @@ Arduino Uno (sensor bridge side)
 - D11 (TX) -> ESP32 GPIO20 (RX) via divider
 - A0 -> moisture Z1
 - A1 -> moisture Z2
-- D2 -> DS18B20 data
+- D2 -> DHT11 Zone 1 data
+- D3 -> DHT11 Zone 2 data
 - D12 -> Ultrasonic TRIG
 - A2  -> Ultrasonic ECHO
+
+DHT11 wiring note:
+- DHT11 module boards: connect VCC/GND/data directly (module usually includes pull-up).
+- Bare DHT11 sensors: add a 10k ohm pull-up from each data pin (D2 and D3) to VCC.
 
 RS485 channels (zone mapping):
 - Channel 1 (MAX3485, 3.3V logic, 4-pin module: VCC/TXD/RXD/GND):
