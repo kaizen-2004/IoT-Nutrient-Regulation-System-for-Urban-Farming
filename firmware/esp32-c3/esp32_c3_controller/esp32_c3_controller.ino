@@ -84,6 +84,7 @@ String provisioningApSsid();
 const char *manualPumpIdByIndex(uint8_t index);
 int8_t manualPumpIndexFromId(const String &pumpId);
 uint8_t manualPumpPinFromIndex(uint8_t index);
+bool manualPumpIsWater(uint8_t index);
 bool manualPumpIsConfigured(uint8_t index);
 const char *manualPumpStateText(uint8_t index, uint32_t now);
 void setManualPumpPin(uint8_t index, bool open);
@@ -146,8 +147,14 @@ const float HUMIDITY_HIGH_WATER_REDUCTION_FACTOR = 0.70f;
 // Relay configuration (set to true if your relay board is active-high)
 const bool VALVE_ACTIVE_HIGH = false;
 
-// Tank level threshold (distance from ultrasonic sensor, reported by Uno).
-const float TANK_LOW_DISTANCE_CM = 24.0f; // Tune for your tank geometry.
+// Tank level thresholds (distance from ultrasonic sensor, reported by Uno).
+// Smaller distance means more water in the tank.
+const float TANK_FULL_MAX_DISTANCE_CM = 6.0f;
+const float TANK_HIGH_MAX_DISTANCE_CM = 14.0f;
+const float TANK_NORMAL_MAX_DISTANCE_CM = 24.0f;
+const float TANK_LOW_MAX_DISTANCE_CM = 34.0f;
+const float TANK_CRITICAL_MAX_DISTANCE_CM = 42.0f;
+const float TANK_LOW_DISTANCE_CM = TANK_LOW_MAX_DISTANCE_CM;
 const bool TANK_FAILSAFE_LOW_ON_SENSOR_ERROR = false;
 const uint8_t TANK_LEVEL_TRIG_PIN = 2;
 const uint8_t TANK_LEVEL_ECHO_PIN = 3;
@@ -213,7 +220,7 @@ const IPAddress PROVISIONING_AP_GATEWAY(192, 168, 4, 1);
 const IPAddress PROVISIONING_AP_SUBNET(255, 255, 255, 0);
 const uint8_t PROVISIONING_MAX_SSID_LEN = 32;
 const uint8_t PROVISIONING_MAX_PASSWORD_LEN = 64;
-const uint32_t PROVISIONING_SUCCESS_HOLD_MS = 30000UL;
+const uint32_t PROVISIONING_SUCCESS_HOLD_MS = 2000UL;
 
 // Hardware fallback setup button.
 // Hold this button to clear Wi-Fi credentials and force setup AP mode.
@@ -289,6 +296,7 @@ uint32_t provisioningSuccessAt = 0;
 uint32_t provisioningConnectEarliestAt = 0;
 String provisioningState = "idle";
 String provisioningFailureReason = "none";
+uint8_t lastWiFiDisconnectReason = 0;
 char configuredWiFiSsid[PROVISIONING_MAX_SSID_LEN + 1] = {0};
 char configuredWiFiPassword[PROVISIONING_MAX_PASSWORD_LEN + 1] = {0};
 #if ENABLE_LOCAL_API_SERVER
@@ -2111,6 +2119,31 @@ const char DASHBOARD_HTML[] PROGMEM = R"HTML(
     function render(status) {
       lastStatus = status;
 
+      function tankLevelFromStatus(s) {
+        const apiLevel = String(s.tankLevel || '').trim().toUpperCase();
+        if (apiLevel) return apiLevel;
+        const d = toNum(s.tankDistanceCm, NaN);
+        if (!Number.isFinite(d)) return 'UNKNOWN';
+        if (d <= 6) return 'FULL';
+        if (d <= 14) return 'HIGH';
+        if (d <= 24) return 'NORMAL';
+        if (d <= 34) return 'LOW';
+        if (d <= 42) return 'CRITICAL';
+        return 'EMPTY';
+      }
+
+      function tankFillPercentFromLevel(level) {
+        switch (level) {
+          case 'FULL': return 95;
+          case 'HIGH': return 72;
+          case 'NORMAL': return 50;
+          case 'LOW': return 30;
+          case 'CRITICAL': return 12;
+          case 'EMPTY': return 5;
+          default: return 25;
+        }
+      }
+
       const zones = Array.isArray(status.zones) ? status.zones : [];
       const z1 = getZone(zones, 1);
       const z2 = getZone(zones, 2);
@@ -2126,6 +2159,7 @@ const char DASHBOARD_HTML[] PROGMEM = R"HTML(
       const phase = String(status.phase || '--').toUpperCase();
       const stepText = phase === 'ACTIVE' ? 'Working' : (phase === 'IDLE' ? 'Waiting' : '--');
       const tankLow = Boolean(status.tankLow);
+      const tankLevel = tankLevelFromStatus(status);
       const phaseDuration = Math.max(1, toNum(status.phaseDurationMs, 0));
       const phaseElapsed = clamp(toNum(status.phaseElapsedMs, 0), 0, phaseDuration);
       const phasePct = clamp((phaseElapsed / phaseDuration) * 100, 0, 100);
@@ -2146,7 +2180,7 @@ const char DASHBOARD_HTML[] PROGMEM = R"HTML(
       spotlightValueEl.textContent = Number.isFinite(avgMoisture) ? fmtValue(avgMoisture, 1, '%') : '--';
       spotlightMetaEl.textContent = Number.isFinite(avgMoisture) ? 'Across both plant areas' : 'Waiting for live readings';
       spotNutrientEl.textContent = Number.isFinite(avgNutrient) ? fmtValue(avgNutrient, 0, ' ppm') : '--';
-      spotTankEl.textContent = tankLow ? 'Low' : 'OK';
+      spotTankEl.textContent = tankLevel;
       spotRemainingEl.textContent = fmtMs(status.phaseRemainingMs);
 
       if (foodGuideNowEl) {
@@ -2167,16 +2201,14 @@ const char DASHBOARD_HTML[] PROGMEM = R"HTML(
         }
       }
 
-      tankBadgeEl.className = 'status-pill ' + (tankLow ? 'alert' : 'good');
-      tankBadgeEl.textContent = tankLow ? 'Low water' : 'Tank OK';
-      tankFillEl.style.height = (tankLow ? 18 : 82) + '%';
-      tankFillEl.style.background = tankLow
+      tankBadgeEl.className = 'status-pill ' + ((tankLevel === 'LOW' || tankLevel === 'CRITICAL' || tankLevel === 'EMPTY') ? 'alert' : 'good');
+      tankBadgeEl.textContent = tankLevel;
+      tankFillEl.style.height = tankFillPercentFromLevel(tankLevel) + '%';
+      tankFillEl.style.background = (tankLevel === 'LOW' || tankLevel === 'CRITICAL' || tankLevel === 'EMPTY')
         ? 'linear-gradient(180deg, #e6a37f 0%, #ba4242 100%)'
         : 'linear-gradient(180deg, #86bfd8 0%, #3d7fa0 100%)';
-      tankValueEl.textContent = tankLow ? 'Please refill tank' : 'Tank is ready';
-      tankTextEl.textContent = tankLow
-        ? 'Watering is paused until the tank has water again.'
-        : 'Water is available for watering.';
+      tankValueEl.textContent = tankLevel;
+      tankTextEl.textContent = 'Water level status: ' + tankLevel + '.';
       sampleAgeTextEl.textContent = fmtMs(sampleAge);
       sampleAgeBarEl.style.width = String(clamp(100 - (sampleAge / SAMPLE_AGE_MAX_MS) * 100, 8, 100)) + '%';
       sampleAgeBarEl.style.background = sampleAge <= 6000
@@ -2185,7 +2217,7 @@ const char DASHBOARD_HTML[] PROGMEM = R"HTML(
 
       if (tankLow) {
         tankAlertEl.className = 'alert show';
-        tankAlertEl.textContent = 'Water tank is low. Please refill to continue normal watering.';
+        tankAlertEl.textContent = 'Water tank status is ' + tankLevel + '. Please refill to continue normal watering.';
       } else if (status.criticalNutrientLockout) {
         tankAlertEl.className = 'alert show';
         tankAlertEl.textContent = 'Plant food level is unsafe. Automatic feeding is paused for safety.';
@@ -2393,6 +2425,44 @@ String currentNetworkIp()
   return String("0.0.0.0");
 }
 
+const char *wifiStatusText(wl_status_t s)
+{
+  switch (s)
+  {
+  case WL_IDLE_STATUS:
+    return "idle";
+  case WL_NO_SSID_AVAIL:
+    return "no_ssid";
+  case WL_SCAN_COMPLETED:
+    return "scan_completed";
+  case WL_CONNECTED:
+    return "connected";
+  case WL_CONNECT_FAILED:
+    return "connect_failed";
+  case WL_CONNECTION_LOST:
+    return "connection_lost";
+  case WL_DISCONNECTED:
+    return "disconnected";
+  default:
+    return "unknown";
+  }
+}
+
+const char *provisioningFailureFromDisconnectReason(uint8_t reason)
+{
+  switch (reason)
+  {
+  case WIFI_REASON_AUTH_FAIL:
+  case WIFI_REASON_HANDSHAKE_TIMEOUT:
+  case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT:
+    return "auth_failed";
+  case WIFI_REASON_NO_AP_FOUND:
+    return "ssid_not_found";
+  default:
+    return "wifi_disconnected";
+  }
+}
+
 void startProvisioningMode(const char *reason)
 {
   stopApiServer();
@@ -2421,6 +2491,10 @@ void startProvisioningMode(const char *reason)
                 apStarted ? "ok" : "failed",
                 provisioningApSsid().c_str(),
                 WiFi.softAPIP().toString().c_str());
+  if (!apStarted)
+  {
+    provisioningFailureReason = "setup_ap_start_failed";
+  }
 }
 
 void stopProvisioningMode()
@@ -2544,7 +2618,12 @@ void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info)
     }
     break;
   case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
-    Serial.printf("[WiFiEvent] STA disconnected. reason=%d\n", (int)info.wifi_sta_disconnected.reason);
+    lastWiFiDisconnectReason = info.wifi_sta_disconnected.reason;
+    Serial.printf("[WiFiEvent] STA disconnected. reason=%d\n", (int)lastWiFiDisconnectReason);
+    if (provisioningMode && provisioningState == "connecting")
+    {
+      provisioningFailureReason = provisioningFailureFromDisconnectReason(lastWiFiDisconnectReason);
+    }
     break;
   default:
     Serial.printf("[WiFiEvent] id=%d\n", (int)event);
@@ -2739,11 +2818,13 @@ void maintainWiFiConnection()
     wl_status_t provisioningStatus = WiFi.status();
     if (provisioningStatus == WL_CONNECTED)
     {
+      provisioningConnectRequested = false;
       provisioningState = "connected";
       provisioningFailureReason = "none";
       if (provisioningSuccessAt == 0)
       {
         provisioningSuccessAt = millis();
+        Serial.println("Provisioning Wi-Fi connected. Setup AP will stop shortly.");
       }
       return;
     }
@@ -2752,7 +2833,13 @@ void maintainWiFiConnection()
     {
       provisioningConnectRequested = false;
       provisioningState = "failed";
-      provisioningFailureReason = (provisioningStatus == WL_NO_SSID_AVAIL) ? "ssid_not_found" : (provisioningStatus == WL_CONNECT_FAILED ? "auth_failed" : "connect_timeout");
+      provisioningFailureReason = (provisioningStatus == WL_NO_SSID_AVAIL)
+                                   ? "ssid_not_found"
+                                   : (provisioningStatus == WL_CONNECT_FAILED)
+                                         ? "auth_failed"
+                                         : (lastWiFiDisconnectReason != 0)
+                                               ? String(provisioningFailureFromDisconnectReason(lastWiFiDisconnectReason))
+                                               : String("connect_timeout");
       lastWiFiBeginAt = 0;
       provisioningConnectEarliestAt = 0;
       WiFi.disconnect(false, false);
@@ -2956,6 +3043,35 @@ const char *humidityBandText(float humidityPct)
   return "humid_high";
 }
 
+const char *tankLevelText(float distanceCm)
+{
+  if (!isfinite(distanceCm))
+  {
+    return "UNKNOWN";
+  }
+  if (distanceCm <= TANK_FULL_MAX_DISTANCE_CM)
+  {
+    return "FULL";
+  }
+  if (distanceCm <= TANK_HIGH_MAX_DISTANCE_CM)
+  {
+    return "HIGH";
+  }
+  if (distanceCm <= TANK_NORMAL_MAX_DISTANCE_CM)
+  {
+    return "NORMAL";
+  }
+  if (distanceCm <= TANK_LOW_MAX_DISTANCE_CM)
+  {
+    return "LOW";
+  }
+  if (distanceCm <= TANK_CRITICAL_MAX_DISTANCE_CM)
+  {
+    return "CRITICAL";
+  }
+  return "EMPTY";
+}
+
 const char *nutrientBandText(float nutrientPpm)
 {
   if (isNutrientCritical(nutrientPpm))
@@ -3144,6 +3260,11 @@ uint8_t manualPumpPinFromIndex(uint8_t index)
   default:
     return UNASSIGNED_PUMP_PIN;
   }
+}
+
+bool manualPumpIsWater(uint8_t index)
+{
+  return index == 0 || index == 1 || index == 3 || index == 4;
 }
 
 bool manualPumpIsConfigured(uint8_t index)
@@ -4128,6 +4249,10 @@ String buildStatusJSON()
   json += "\"tankDistanceCm\":";
   json += isnan(latestTankDistanceCm) ? "null" : String(latestTankDistanceCm, 2);
   json += ",";
+  json += "\"tankLevel\":\"";
+  json += tankLevelText(latestTankDistanceCm);
+  json += "\"";
+  json += ",";
   json += "\"lastWaterPulseMs\":";
   json += String(lastWaterPulseMs);
   json += ",";
@@ -4321,7 +4446,19 @@ String buildProvisioningInfoJSON()
   json += "\",";
   json += "\"status\":\"";
   json += jsonEscape(provisioningState);
-  json += "\"}";
+  json += "\",";
+  json += "\"failureReason\":\"";
+  json += jsonEscape(provisioningFailureReason);
+  json += "\",";
+  json += "\"setupApActive\":";
+  json += provisioningMode ? "true" : "false";
+  json += ",";
+  json += "\"wifiStatus\":\"";
+  json += wifiStatusText(WiFi.status());
+  json += "\",";
+  json += "\"lastDisconnectReason\":";
+  json += String(lastWiFiDisconnectReason);
+  json += "}";
   return json;
 }
 
@@ -4346,6 +4483,29 @@ String buildProvisioningResultJSON()
     json += "\",\"ssid\":\"";
     json += jsonEscape(String(configuredWiFiSsid));
     json += "\"";
+  }
+  json += ",\"setupApActive\":";
+  json += provisioningMode ? "true" : "false";
+  json += ",\"setupSsid\":\"";
+  json += jsonEscape(provisioningApSsid());
+  json += "\"";
+  json += ",\"wifiStatus\":\"";
+  json += wifiStatusText(WiFi.status());
+  json += "\"";
+  json += ",\"lastDisconnectReason\":";
+  json += String(lastWiFiDisconnectReason);
+  json += ",\"connectRequested\":";
+  json += provisioningConnectRequested ? "true" : "false";
+  json += ",\"apShutdownInMs\":";
+  if (provisioningMode && provisioningState == "connected" && provisioningSuccessAt != 0)
+  {
+    uint32_t elapsed = (uint32_t)(millis() - provisioningSuccessAt);
+    uint32_t remaining = elapsed >= PROVISIONING_SUCCESS_HOLD_MS ? 0 : (PROVISIONING_SUCCESS_HOLD_MS - elapsed);
+    json += String(remaining);
+  }
+  else
+  {
+    json += "0";
   }
   json += "}";
   return json;
@@ -4511,6 +4671,13 @@ void handleManualPump()
   if (!manualPumpIsConfigured((uint8_t)index))
   {
     sendJsonResponse(409, "{\"reason\":\"not_configured\"}");
+    return;
+  }
+
+  if (manualPumpIsWater((uint8_t)index) && latestTankLow)
+  {
+    setAlertMessage(String("Manual watering blocked: tank level is ") + tankLevelText(latestTankDistanceCm) + ". Refill tank.");
+    sendJsonResponse(409, "{\"reason\":\"tank_low\"}");
     return;
   }
 
@@ -4694,6 +4861,10 @@ String buildStatusJSON()
   {
     json += String(latestTankDistanceCm, 2);
   }
+  json += ",";
+  json += "\"tankLevel\":\"";
+  json += tankLevelText(latestTankDistanceCm);
+  json += "\"";
   json += ",";
   json += "\"lastWaterPulseMs\":";
   json += String(lastWaterPulseMs);
@@ -5287,12 +5458,12 @@ void executeControlCycle()
     maybeSendTankLowEmail();
   }
 
- /* if (tankLow && requestedWaterMs > 0)
+  if (tankLow && requestedWaterMs > 0)
   {
     Serial.println("{\"type\":\"safety\",\"event\":\"water_blocked\",\"reason\":\"tank_low\"}");
+    setAlertMessage(String("Watering blocked: tank level is ") + tankLevelText(latestTankDistanceCm) + ". Refill tank.");
     requestedWaterMs = 0;
   }
- */ 
 
   uint32_t elapsed = millis() - cycleStart;
   uint32_t remaining = (elapsed < ACTIVE_DURATION_MS) ? (ACTIVE_DURATION_MS - elapsed) : 0;

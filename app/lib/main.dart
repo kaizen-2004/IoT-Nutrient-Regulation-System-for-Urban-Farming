@@ -5,7 +5,9 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:http/http.dart' as http;
+import 'package:image_picker/image_picker.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
+import 'package:network_info_plus/network_info_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 Future<void> main() async {
@@ -342,6 +344,17 @@ String friendlyApiMessage(String raw) {
       return 'The request format is invalid.';
     case 'invalid_wifi_credentials':
       return 'Wi-Fi name or password is incorrect.';
+    case 'ssid_not_found':
+      return 'The Wi-Fi network name was not found. Check the SSID and try again.';
+    case 'auth_failed':
+      return 'Wi-Fi password appears incorrect. Please retry.';
+    case 'connect_timeout':
+      return 'The controller timed out while joining Wi-Fi. Check signal and try again.';
+    case 'setup_ap_inactive':
+    case 'not_in_provisioning_mode':
+      return 'The setup access point is no longer active. Re-enter setup mode and try again.';
+    case 'setup_ap_start_failed':
+      return 'The controller could not start setup mode. Press the setup button and retry.';
     default:
       return raw;
   }
@@ -639,13 +652,31 @@ class QrPayload {
   final String setupIp;
 
   factory QrPayload.fromRaw(String raw) {
-    final decoded = jsonDecode(raw) as Map<String, dynamic>;
+    final decoded = jsonDecode(raw);
+    if (decoded is! Map<String, dynamic>) {
+      throw const FormatException('QR payload must be a JSON object.');
+    }
+
+    final deviceId = (decoded['deviceId'] ?? '').toString().trim();
+    if (deviceId.isEmpty) {
+      throw const FormatException('QR payload is missing deviceId.');
+    }
+
+    final setupIp = (decoded['setupIp'] ?? '192.168.4.1').toString().trim();
+    final isIpLike = RegExp(r'^\d{1,3}(\.\d{1,3}){3}$').hasMatch(setupIp);
+    if (!isIpLike) {
+      throw const FormatException('QR payload has invalid setupIp.');
+    }
+
+    final setupAp =
+        (decoded['setupAp'] ?? decoded['apSsid'] ?? 'NutrientReg-Setup')
+            .toString();
     return QrPayload(
       version: (decoded['v'] ?? 1) as int,
       model: (decoded['model'] ?? 'NRS-C3') as String,
-      deviceId: (decoded['deviceId'] ?? '') as String,
-      setupAp: (decoded['setupAp'] ?? 'NutrientReg-Setup') as String,
-      setupIp: (decoded['setupIp'] ?? '192.168.4.1') as String,
+      deviceId: deviceId,
+      setupAp: setupAp,
+      setupIp: setupIp,
     );
   }
 }
@@ -759,6 +790,16 @@ Future<String?> discoverDeviceIp({
 }) async {
   final prefixes = <String>[];
 
+  try {
+    final wifiIp = await NetworkInfo().getWifiIP();
+    if (wifiIp != null && wifiIp.isNotEmpty) {
+      final lastDot = wifiIp.lastIndexOf('.');
+      if (lastDot > 0) {
+        prefixes.add(wifiIp.substring(0, lastDot + 1));
+      }
+    }
+  } catch (_) {}
+
   if (preferredIp != null && preferredIp.isNotEmpty) {
     final lastDot = preferredIp.lastIndexOf('.');
     if (lastDot > 0) {
@@ -853,6 +894,7 @@ class OnboardingScreen extends StatefulWidget {
 class _OnboardingScreenState extends State<OnboardingScreen> {
   QrPayload? _payload;
   String? _error;
+  final ImagePicker _imagePicker = ImagePicker();
 
   Future<void> _openScanner() async {
     final raw = await Navigator.of(
@@ -902,6 +944,41 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
     _applyPayload(raw);
   }
 
+  Future<void> _uploadQrImage() async {
+    try {
+      final picked = await _imagePicker.pickImage(source: ImageSource.gallery);
+      if (picked == null) {
+        return;
+      }
+
+      final scanner = MobileScannerController();
+      try {
+        final capture = await scanner.analyzeImage(picked.path);
+        String? raw;
+        if (capture != null && capture.barcodes.isNotEmpty) {
+          raw = capture.barcodes.first.rawValue;
+        }
+        if (raw == null || raw.isEmpty) {
+          setState(() {
+            _error = 'No valid QR content was found in the selected image.';
+          });
+          return;
+        }
+        _applyPayload(raw);
+      } finally {
+        await scanner.dispose();
+      }
+    } catch (_) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _error =
+            'Could not read a QR from that image. Try a clearer photo or use manual paste.';
+      });
+    }
+  }
+
   void _applyPayload(String raw) {
     try {
       final payload = QrPayload.fromRaw(raw);
@@ -909,10 +986,11 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
         _payload = payload;
         _error = null;
       });
-    } catch (_) {
+    } catch (error) {
       setState(() {
-        _error =
-            'The scanned code does not match the expected device QR format.';
+        _error = error is FormatException
+            ? error.message
+            : 'The scanned code does not match the expected device QR format.';
       });
     }
   }
@@ -1026,6 +1104,11 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
                     onPressed: _pastePayload,
                     icon: const Icon(Icons.content_paste),
                     label: const Text('Paste QR payload manually'),
+                  ),
+                  TextButton.icon(
+                    onPressed: _uploadQrImage,
+                    icon: const Icon(Icons.photo_library_outlined),
+                    label: const Text('Upload QR image'),
                   ),
                   const SizedBox(height: 8),
                   TextButton.icon(
@@ -1886,9 +1969,9 @@ class _DashboardScreenState extends State<DashboardScreen>
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
-        title: const Text('Reset Wi-Fi'),
+        title: const Text('Set Up Wi-Fi Again'),
         content: const Text(
-          'The device will clear saved Wi-Fi credentials and reboot back into setup mode.',
+          'This will clear the controller\'s saved Wi-Fi credentials and return it to setup mode. You will need to enter Wi-Fi details again.',
         ),
         actions: [
           TextButton(
@@ -1922,6 +2005,65 @@ class _DashboardScreenState extends State<DashboardScreen>
             ),
           ),
         ),
+      );
+    }
+  }
+
+  Future<void> _updateControllerIp() async {
+    final controller = TextEditingController(text: widget.device.lastKnownIp);
+    final newIp = await showDialog<String>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Update Controller IP'),
+        content: TextField(
+          controller: controller,
+          decoration: const InputDecoration(
+            labelText: 'Controller IP',
+            hintText: '192.168.1.17',
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(context).pop(controller.text.trim()),
+            child: const Text('Verify and save'),
+          ),
+        ],
+      ),
+    );
+
+    if (newIp == null || newIp.isEmpty) {
+      return;
+    }
+
+    try {
+      final info = await _api.fetchInfo(newIp);
+      final foundDeviceId = (info['deviceId'] ?? '').toString();
+      if (foundDeviceId.isNotEmpty && foundDeviceId != widget.device.deviceId) {
+        throw const ApiException(
+          'This IP belongs to a different controller. Please check and try again.',
+        );
+      }
+      await widget.onDeviceUpdated(widget.device.copyWith(lastKnownIp: newIp));
+      if (!mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Controller IP updated to $newIp.')),
+      );
+      _refresh();
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+      final message = error is ApiException
+          ? friendlyApiMessage(error.message)
+          : 'Could not verify controller at $newIp.';
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(message)),
       );
     }
   }
@@ -2074,6 +2216,7 @@ class _DashboardScreenState extends State<DashboardScreen>
                     device: widget.device,
                     info: _info,
                     status: status,
+                    onUpdateControllerIp: _updateControllerIp,
                     onResetWifi: _resetWifi,
                   ),
                   _HelpTab(
@@ -2125,9 +2268,14 @@ class _OverviewTab extends StatelessWidget {
     final avgNutrient = _averageZoneValue(zones, 'nutrientPpm');
     final phaseProgress = _phaseProgress(data);
     final tankDistance = _asDouble(data['tankDistanceCm']);
-    final tankPercent = _tankPercent(
+    final tankLevel = _tankLevelLabel(data);
+    final tankLevelDetail = _tankLevelDetail(tankLevel);
+    final tankPercent = _tankPercentForLevel(
+      tankLevel,
+      fallback: _tankPercent(
       tankDistance,
       (data['tankLow'] ?? false) == true,
+      ),
     );
     final sampleAge = _sampleAgeText(data['sampleAgeMs']);
     final manualPumpStates =
@@ -2266,9 +2414,7 @@ class _OverviewTab extends StatelessWidget {
             children: [
               _SectionHeader(
                 title: 'Water tank',
-                subtitle: (data['tankLow'] ?? false) == true
-                    ? 'Needs attention soon'
-                    : 'Operating normally',
+                subtitle: tankLevel,
               ),
               const SizedBox(height: 16),
               LayoutBuilder(
@@ -2277,18 +2423,21 @@ class _OverviewTab extends StatelessWidget {
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       Text(
-                        tankDistance == null
-                            ? 'Distance unavailable'
-                            : '${tankDistance.toStringAsFixed(1)} cm',
+                        tankLevel,
                         style: Theme.of(context).textTheme.headlineSmall
                             ?.copyWith(fontWeight: FontWeight.w700),
                       ),
                       const SizedBox(height: 6),
-                      Text(
-                        (data['tankLow'] ?? false) == true
-                            ? 'Water level is below the safe range. Refill soon.'
-                            : 'Water level is in the safe range for the current cycle.',
-                      ),
+                      Text(tankLevelDetail),
+                      if (tankDistance != null) ...[
+                        const SizedBox(height: 6),
+                        Text(
+                          'Measured distance: ${tankDistance.toStringAsFixed(1)} cm',
+                          style: TextStyle(
+                            color: Theme.of(context).colorScheme.onSurfaceVariant,
+                          ),
+                        ),
+                      ],
                       const SizedBox(height: 14),
                       _ProgressStrip(
                         label: 'Freshness',
@@ -2675,12 +2824,14 @@ class _DeviceTab extends StatelessWidget {
     required this.device,
     required this.info,
     required this.status,
+    required this.onUpdateControllerIp,
     required this.onResetWifi,
   });
 
   final DeviceRecord device;
   final Map<String, dynamic>? info;
   final Map<String, dynamic>? status;
+  final Future<void> Function() onUpdateControllerIp;
   final Future<void> Function() onResetWifi;
 
   @override
@@ -2790,19 +2941,25 @@ class _DeviceTab extends StatelessWidget {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              const _SectionHeader(
-                title: 'Recovery',
-                subtitle:
-                    'Return the controller to setup mode when you need a new router or password',
-              ),
-              const SizedBox(height: 12),
-              FilledButton.tonalIcon(
-                onPressed: onResetWifi,
-                icon: const Icon(Icons.restart_alt),
-                label: const Text('Reset Wi-Fi and return to setup mode'),
-              ),
-            ],
-          ),
+                const _SectionHeader(
+                  title: 'Recovery',
+                  subtitle:
+                      'Fix IP changes or set up Wi-Fi again when needed',
+                ),
+                const SizedBox(height: 12),
+                OutlinedButton.icon(
+                  onPressed: () => unawaited(onUpdateControllerIp()),
+                  icon: const Icon(Icons.edit_location_alt_outlined),
+                  label: const Text('Update controller IP'),
+                ),
+                const SizedBox(height: 8),
+                FilledButton.tonalIcon(
+                  onPressed: () => unawaited(onResetWifi()),
+                  icon: const Icon(Icons.restart_alt),
+                  label: const Text('Set Up Wi-Fi Again'),
+                ),
+              ],
+            ),
         ),
       ],
     );
@@ -4031,6 +4188,62 @@ double _tankPercent(double? tankDistance, bool isLow) {
     return clamped.clamp(0.08, 0.28);
   }
   return clamped;
+}
+
+double _tankPercentForLevel(String level, {required double fallback}) {
+  switch (level) {
+    case 'FULL':
+      return 0.95;
+    case 'HIGH':
+      return 0.72;
+    case 'NORMAL':
+      return 0.50;
+    case 'LOW':
+      return 0.30;
+    case 'CRITICAL':
+      return 0.12;
+    case 'EMPTY':
+      return 0.05;
+    default:
+      return fallback;
+  }
+}
+
+String _tankLevelLabel(Map<String, dynamic> data) {
+  final dynamic rawLevel = data['tankLevel'];
+  if (rawLevel is String && rawLevel.trim().isNotEmpty) {
+    return rawLevel.trim().toUpperCase();
+  }
+
+  final distance = _asDouble(data['tankDistanceCm']);
+  if (distance == null) {
+    return 'UNKNOWN';
+  }
+  if (distance <= 6) return 'FULL';
+  if (distance <= 14) return 'HIGH';
+  if (distance <= 24) return 'NORMAL';
+  if (distance <= 34) return 'LOW';
+  if (distance <= 42) return 'CRITICAL';
+  return 'EMPTY';
+}
+
+String _tankLevelDetail(String level) {
+  switch (level) {
+    case 'FULL':
+      return 'Tank is full and ready for watering cycles.';
+    case 'HIGH':
+      return 'Tank level is high and operating comfortably.';
+    case 'NORMAL':
+      return 'Tank level is in the normal operating range.';
+    case 'LOW':
+      return 'Tank level is low. Plan a refill soon.';
+    case 'CRITICAL':
+      return 'Tank level is critical. Refill immediately.';
+    case 'EMPTY':
+      return 'Tank is empty. Watering should remain blocked until refill.';
+    default:
+      return 'Waiting for reliable tank sensor data.';
+  }
 }
 
 List<double> _combineSeries(List<double> a, List<double> b) {
