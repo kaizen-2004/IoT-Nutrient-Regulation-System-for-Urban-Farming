@@ -24,7 +24,7 @@ Arduino Uno (sensor bridge side)
 - D2 -> DHT11 Zone 1 data
 - D3 -> DHT11 Zone 2 data
 - D12 -> Ultrasonic TRIG
-- A2  -> Ultrasonic ECHO
+- D6  -> Ultrasonic ECHO
 
 DHT11 wiring note:
 - DHT11 module boards: connect VCC/GND/data directly (module usually includes pull-up).
@@ -57,5 +57,5 @@ Voltage-divider rule (must-have)
 - Not required on:
   - ESP32 GPIO21 TX -> Uno D10 RX
   - MAX3485 TXD -> Uno D4 RX
-  - Uno ultrasonic connections (D12/A2)
+  - Uno ultrasonic connections (D12/D6)
 ---

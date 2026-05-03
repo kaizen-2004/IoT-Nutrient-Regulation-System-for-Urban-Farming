@@ -14,9 +14,9 @@ const uint8_t MOISTURE_2_PIN = A1;
 const int MOISTURE_DRY_RAW = 850;
 const int MOISTURE_WET_RAW = 420;
 
-const uint8_t DHT11_ZONE1_PIN = 2;
-const uint8_t DHT11_ZONE2_PIN = 3;
-const uint8_t DHT11_SENSOR_TYPE = DHT11;
+const uint8_t DHT_ZONE1_PIN = 2;
+const uint8_t DHT_ZONE2_PIN = 3;
+const uint8_t DHT_SENSOR_TYPE = DHT22;
 const float DEFAULT_TEMP_C = 25.0f;
 const float DEFAULT_HUMIDITY_PCT = 60.0f;
 
@@ -51,15 +51,15 @@ const uint32_t RS485_SCAN_BAUDS[] = {4800, 9600, 2400, 19200};
 const uint8_t RS485_ADDR_SCAN_MIN = 1;
 const uint8_t RS485_ADDR_SCAN_MAX = 8;
 
-const bool ENABLE_DHT11 = true;
+const bool ENABLE_DHT = true;
 const bool ENABLE_RS485_NPK = true;
 
 SoftwareSerial espLink(ESP_LINK_RX_PIN, ESP_LINK_TX_PIN);
 SoftwareSerial rs485Serial1(RS485_1_RX_PIN, RS485_1_TX_PIN);
 SoftwareSerial rs485Serial2(RS485_2_RX_PIN, RS485_2_TX_PIN);
 
-DHT dhtZone1(DHT11_ZONE1_PIN, DHT11_SENSOR_TYPE);
-DHT dhtZone2(DHT11_ZONE2_PIN, DHT11_SENSOR_TYPE);
+DHT dhtZone1(DHT_ZONE1_PIN, DHT_SENSOR_TYPE);
+DHT dhtZone2(DHT_ZONE2_PIN, DHT_SENSOR_TYPE);
 
 uint32_t seqCounter = 0;
 uint32_t lastTelemetryAt = 0;
@@ -169,19 +169,19 @@ float readTankDistanceCm() {
   return sum / (float)valid;
 }
 
-void initDht11() {
+void initDht() {
   dhtZone1.begin();
   dhtZone2.begin();
   Serial.println("[uno] dht11 z1/z2 initialized");
 }
 
-void readDht11TempsHumidity(float &temp1, float &temp2, float &humidity1, float &humidity2) {
+void readDhtTempsHumidity(float &temp1, float &temp2, float &humidity1, float &humidity2) {
   temp1 = lastTemp1;
   temp2 = lastTemp2;
   humidity1 = lastHumidity1;
   humidity2 = lastHumidity2;
 
-  if (!ENABLE_DHT11) {
+  if (!ENABLE_DHT) {
     return;
   }
 
@@ -408,7 +408,7 @@ void sendTelemetryFrame() {
   float t2 = lastTemp2;
   float h1 = lastHumidity1;
   float h2 = lastHumidity2;
-  readDht11TempsHumidity(t1, t2, h1, h2);
+  readDhtTempsHumidity(t1, t2, h1, h2);
 
   float n1 = lastN[0];
   float p1 = lastP[0];
@@ -580,7 +580,7 @@ void setup() {
     rs485SetTx(RS485_2_DE_RE_PIN, false);
   }
 
-  initDht11();
+  initDht();
 
   if (ENABLE_RS485_1_AUTODETECT) {
     if (autodetectRs485Channel(rs485Serial1,
