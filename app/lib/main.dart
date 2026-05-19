@@ -59,8 +59,8 @@ class NotificationService {
 
     const tankChannel = AndroidNotificationChannel(
       'nutrient_tank_alerts',
-      'Tank Alerts',
-      description: 'Alerts for low water tank conditions',
+      'Clean Water Tank Alerts',
+      description: 'Alerts for low clean water tank conditions',
       importance: Importance.high,
     );
     const connectivityChannel = AndroidNotificationChannel(
@@ -91,14 +91,19 @@ class NotificationService {
       android: AndroidNotificationDetails(
         'nutrient_tank_alerts',
         'Tank Alerts',
-        channelDescription: 'Alerts for low water tank conditions',
+        channelDescription: 'Alerts for low clean water tank conditions',
         importance: Importance.high,
         priority: Priority.high,
       ),
       iOS: DarwinNotificationDetails(),
     );
 
-    await _plugin.show(1001, '$deviceName: Water tank low', body, details);
+    await _plugin.show(
+      1001,
+      '$deviceName: Clean water tank low',
+      body,
+      details,
+    );
   }
 
   Future<void> showControllerOfflineNotification({
@@ -155,6 +160,30 @@ class ManualPumpControl {
   final String id;
   final String label;
 }
+
+class PumpProfileOption {
+  const PumpProfileOption({
+    required this.id,
+    required this.label,
+    required this.multiplier,
+  });
+
+  final String id;
+  final String label;
+  final double multiplier;
+}
+
+const List<PumpProfileOption> kDefaultPumpProfiles = [
+  PumpProfileOption(id: 'water_saving', label: 'Water Saving', multiplier: 0.5),
+  PumpProfileOption(id: 'gentle', label: 'Gentle', multiplier: 0.75),
+  PumpProfileOption(id: 'balanced', label: 'Balanced', multiplier: 1.0),
+  PumpProfileOption(id: 'fast', label: 'Fast', multiplier: 1.25),
+  PumpProfileOption(id: 'max_pumping', label: 'Max Pumping', multiplier: 1.5),
+];
+
+const List<int> kManualWaterDurationOptionsMs = [3000, 5000, 10000, 15000];
+const List<int> kManualNutrientDurationOptionsMs = [3000, 5000, 10000];
+const int kDefaultManualPumpDurationMs = 5000;
 
 const List<ManualPumpControl> kManualPumpControls = [
   ManualPumpControl(id: 'zone1Water1', label: 'Zone 1 Water 1'),
@@ -324,10 +353,50 @@ class ManualGuideStore {
   }
 }
 
+class ManualPumpDurationStore {
+  static const _waterPrefix = 'manual_water_duration_ms_';
+  static const _nutrientPrefix = 'manual_nutrient_duration_ms_';
+
+  static Future<int> loadWaterDuration(String deviceId) async {
+    final prefs = await SharedPreferences.getInstance();
+    final value = prefs.getInt('$_waterPrefix$deviceId');
+    return value != null && kManualWaterDurationOptionsMs.contains(value)
+        ? value
+        : kDefaultManualPumpDurationMs;
+  }
+
+  static Future<int> loadNutrientDuration(String deviceId) async {
+    final prefs = await SharedPreferences.getInstance();
+    final value = prefs.getInt('$_nutrientPrefix$deviceId');
+    return value != null && kManualNutrientDurationOptionsMs.contains(value)
+        ? value
+        : kDefaultManualPumpDurationMs;
+  }
+
+  static Future<void> saveWaterDuration(String deviceId, int durationMs) async {
+    if (!kManualWaterDurationOptionsMs.contains(durationMs)) {
+      return;
+    }
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setInt('$_waterPrefix$deviceId', durationMs);
+  }
+
+  static Future<void> saveNutrientDuration(
+    String deviceId,
+    int durationMs,
+  ) async {
+    if (!kManualNutrientDurationOptionsMs.contains(durationMs)) {
+      return;
+    }
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setInt('$_nutrientPrefix$deviceId', durationMs);
+  }
+}
+
 String friendlyApiMessage(String raw) {
   switch (raw) {
     case 'tank_low':
-      return 'Water tank is low. Please refill before watering.';
+      return 'Clean water tank is low. Please refill before watering.';
     case 'cooldown':
       return 'Please wait a bit before using this pump again.';
     case 'busy':
@@ -342,6 +411,11 @@ String friendlyApiMessage(String raw) {
       return 'Device is in setup mode. Finish setup first.';
     case 'invalid_payload':
       return 'The request format is invalid.';
+    case 'invalid_water_profile':
+    case 'invalid_nutrient_profile':
+      return 'Selected pump profile is not supported by this controller.';
+    case 'settings_save_failed':
+      return 'Controller could not save pump settings. Please try again.';
     case 'invalid_wifi_credentials':
       return 'Wi-Fi name or password is incorrect.';
     case 'ssid_not_found':
@@ -765,6 +839,25 @@ class DeviceApi {
 
   Future<Map<String, dynamic>> fetchStatus(String host) {
     return _getJson(host, '/api/status');
+  }
+
+  Future<Map<String, dynamic>> fetchSettings(String host) {
+    return _getJson(host, '/api/settings');
+  }
+
+  Future<Map<String, dynamic>> updateSettings({
+    required String host,
+    String? waterPulseProfile,
+    String? nutrientPulseProfile,
+  }) {
+    final body = <String, dynamic>{};
+    if (waterPulseProfile != null) {
+      body['waterPulseProfile'] = waterPulseProfile;
+    }
+    if (nutrientPulseProfile != null) {
+      body['nutrientPulseProfile'] = nutrientPulseProfile;
+    }
+    return _postJson(host, '/api/settings', body);
   }
 
   Future<Map<String, dynamic>> resetWifi(String host) {
@@ -1689,6 +1782,7 @@ class _DashboardScreenState extends State<DashboardScreen>
   Timer? _pollTimer;
   Map<String, dynamic>? _info;
   Map<String, dynamic>? _status;
+  Map<String, dynamic>? _settings;
   final Map<int, _ZoneHistory> _zoneHistory = {
     1: _ZoneHistory(),
     2: _ZoneHistory(),
@@ -1703,8 +1797,9 @@ class _DashboardScreenState extends State<DashboardScreen>
   Set<String> _manualDoneSteps = <String>{};
   bool _manualPumpRequestInFlight = false;
   String? _manualPumpInFlightId;
-
-  static const int _manualPumpDurationMs = 5000;
+  bool _settingsRequestInFlight = false;
+  int _manualWaterDurationMs = kDefaultManualPumpDurationMs;
+  int _manualNutrientDurationMs = kDefaultManualPumpDurationMs;
 
   String get _host => widget.device.lastKnownIp;
 
@@ -1713,9 +1808,11 @@ class _DashboardScreenState extends State<DashboardScreen>
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     unawaited(_loadManualProgress());
+    unawaited(_loadManualDurations());
     WidgetsBinding.instance.addPostFrameCallback((_) {
       unawaited(_maybePromptGuide());
     });
+    unawaited(_loadControllerSettings());
     _refresh();
     _pollTimer = Timer.periodic(const Duration(seconds: 3), (_) {
       _refresh(silent: true);
@@ -1734,6 +1831,123 @@ class _DashboardScreenState extends State<DashboardScreen>
       _manualCurrentStep = current;
       _manualDoneSteps = done;
     });
+  }
+
+  Future<void> _loadManualDurations() async {
+    final results = await Future.wait([
+      ManualPumpDurationStore.loadWaterDuration(widget.device.deviceId),
+      ManualPumpDurationStore.loadNutrientDuration(widget.device.deviceId),
+    ]);
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _manualWaterDurationMs = results[0];
+      _manualNutrientDurationMs = results[1];
+    });
+  }
+
+  Future<void> _loadControllerSettings() async {
+    try {
+      final settings = await _api.fetchSettings(_host);
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _settings = settings;
+      });
+    } catch (_) {
+      return;
+    }
+  }
+
+  Future<void> _updateWaterPulseProfile(String profileId) async {
+    await _updateControllerSettings(waterPulseProfile: profileId);
+  }
+
+  Future<void> _updateNutrientPulseProfile(String profileId) async {
+    await _updateControllerSettings(nutrientPulseProfile: profileId);
+  }
+
+  Future<void> _updateControllerSettings({
+    String? waterPulseProfile,
+    String? nutrientPulseProfile,
+  }) async {
+    if (_settingsRequestInFlight) {
+      return;
+    }
+
+    final previous = _settings;
+    final next = Map<String, dynamic>.from(
+      previous ?? const <String, dynamic>{},
+    );
+    if (waterPulseProfile != null) {
+      next['waterPulseProfile'] = waterPulseProfile;
+    }
+    if (nutrientPulseProfile != null) {
+      next['nutrientPulseProfile'] = nutrientPulseProfile;
+    }
+
+    setState(() {
+      _settingsRequestInFlight = true;
+      _settings = next;
+    });
+
+    try {
+      final saved = await _api.updateSettings(
+        host: _host,
+        waterPulseProfile: waterPulseProfile,
+        nutrientPulseProfile: nutrientPulseProfile,
+      );
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _settings = saved;
+      });
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _settings = previous;
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            friendlyApiMessage(
+              error.toString().replaceFirst('Exception: ', ''),
+            ),
+          ),
+        ),
+      );
+    } finally {
+      if (mounted) {
+        setState(() {
+          _settingsRequestInFlight = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _updateManualWaterDuration(int durationMs) async {
+    setState(() {
+      _manualWaterDurationMs = durationMs;
+    });
+    await ManualPumpDurationStore.saveWaterDuration(
+      widget.device.deviceId,
+      durationMs,
+    );
+  }
+
+  Future<void> _updateManualNutrientDuration(int durationMs) async {
+    setState(() {
+      _manualNutrientDurationMs = durationMs;
+    });
+    await ManualPumpDurationStore.saveNutrientDuration(
+      widget.device.deviceId,
+      durationMs,
+    );
   }
 
   Future<void> _openGuide({bool reset = false}) async {
@@ -1912,7 +2126,8 @@ class _DashboardScreenState extends State<DashboardScreen>
     Map<String, dynamic> status,
     String deviceName,
   ) async {
-    final tankLow = (status['tankLow'] ?? false) == true;
+    final tankLow =
+        (status['cleanWaterTankLow'] ?? status['tankLow'] ?? false) == true;
     _offlineNotificationShown = false;
     await NotificationService.instance.clearAlertState('$deviceName:offline');
 
@@ -1921,7 +2136,7 @@ class _DashboardScreenState extends State<DashboardScreen>
       await NotificationService.instance.showLowTankNotification(
         deviceName: deviceName,
         body:
-            'The controller reported a low water tank. Refill the tank soon to avoid watering interruption.',
+            'The controller reported a low clean water tank. Refill it soon to avoid watering interruption.',
       );
     } else if (!tankLow) {
       _lowTankNotificationShown = false;
@@ -2062,9 +2277,9 @@ class _DashboardScreenState extends State<DashboardScreen>
       final message = error is ApiException
           ? friendlyApiMessage(error.message)
           : 'Could not verify controller at $newIp.';
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(message)),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(message)));
     }
   }
 
@@ -2072,6 +2287,10 @@ class _DashboardScreenState extends State<DashboardScreen>
     if (_manualPumpRequestInFlight) {
       return;
     }
+
+    final durationMs = _manualPumpIsWaterId(pumpId)
+        ? _manualWaterDurationMs
+        : _manualNutrientDurationMs;
 
     setState(() {
       _manualPumpRequestInFlight = true;
@@ -2082,7 +2301,7 @@ class _DashboardScreenState extends State<DashboardScreen>
       await _api.runManualPump(
         host: _host,
         pumpId: pumpId,
-        durationMs: _manualPumpDurationMs,
+        durationMs: durationMs,
       );
       if (!mounted) {
         return;
@@ -2090,7 +2309,7 @@ class _DashboardScreenState extends State<DashboardScreen>
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text(
-            'Started ${_manualPumpLabelFromId(pumpId)} for ${(_manualPumpDurationMs / 1000).toStringAsFixed(0)}s.',
+            'Started ${_manualPumpLabelFromId(pumpId)} for ${(durationMs / 1000).toStringAsFixed(0)}s.',
           ),
         ),
       );
@@ -2209,15 +2428,25 @@ class _DashboardScreenState extends State<DashboardScreen>
                     onRunManualPump: _runManualPump,
                     manualPumpRequestInFlight: _manualPumpRequestInFlight,
                     manualPumpInFlightId: _manualPumpInFlightId,
-                    manualPumpDurationMs: _manualPumpDurationMs,
+                    manualWaterDurationMs: _manualWaterDurationMs,
+                    manualNutrientDurationMs: _manualNutrientDurationMs,
                   ),
                   _ZonesTab(zones: zones, histories: _zoneHistory),
                   _DeviceTab(
                     device: widget.device,
                     info: _info,
                     status: status,
+                    settings: _settings,
+                    settingsRequestInFlight: _settingsRequestInFlight,
+                    manualWaterDurationMs: _manualWaterDurationMs,
+                    manualNutrientDurationMs: _manualNutrientDurationMs,
                     onUpdateControllerIp: _updateControllerIp,
                     onResetWifi: _resetWifi,
+                    onWaterPulseProfileChanged: _updateWaterPulseProfile,
+                    onNutrientPulseProfileChanged: _updateNutrientPulseProfile,
+                    onManualWaterDurationChanged: _updateManualWaterDuration,
+                    onManualNutrientDurationChanged:
+                        _updateManualNutrientDuration,
                   ),
                   _HelpTab(
                     deviceId: widget.device.deviceId,
@@ -2243,7 +2472,8 @@ class _OverviewTab extends StatelessWidget {
     required this.onRunManualPump,
     required this.manualPumpRequestInFlight,
     required this.manualPumpInFlightId,
-    required this.manualPumpDurationMs,
+    required this.manualWaterDurationMs,
+    required this.manualNutrientDurationMs,
   });
 
   final Map<String, dynamic>? status;
@@ -2251,7 +2481,8 @@ class _OverviewTab extends StatelessWidget {
   final Future<void> Function(String pumpId) onRunManualPump;
   final bool manualPumpRequestInFlight;
   final String? manualPumpInFlightId;
-  final int manualPumpDurationMs;
+  final int manualWaterDurationMs;
+  final int manualNutrientDurationMs;
 
   @override
   Widget build(BuildContext context) {
@@ -2272,10 +2503,7 @@ class _OverviewTab extends StatelessWidget {
     final tankLevelDetail = _tankLevelDetail(tankLevel);
     final tankPercent = _tankPercentForLevel(
       tankLevel,
-      fallback: _tankPercent(
-      tankDistance,
-      (data['tankLow'] ?? false) == true,
-      ),
+      fallback: _tankPercent(tankDistance, (data['tankLow'] ?? false) == true),
     );
     final sampleAge = _sampleAgeText(data['sampleAgeMs']);
     final manualPumpStates =
@@ -2326,7 +2554,7 @@ class _OverviewTab extends StatelessWidget {
               ),
               const SizedBox(height: 8),
               Text(
-                'Track watering, nutrients, and tank status in one place.',
+                'Track watering, nutrients, and clean water tank status in one place.',
                 style: const TextStyle(color: Color(0xFFD9ECE2), height: 1.35),
               ),
               const SizedBox(height: 20),
@@ -2412,10 +2640,7 @@ class _OverviewTab extends StatelessWidget {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              _SectionHeader(
-                title: 'Water tank',
-                subtitle: tankLevel,
-              ),
+              _SectionHeader(title: 'Clean water tank', subtitle: tankLevel),
               const SizedBox(height: 16),
               LayoutBuilder(
                 builder: (context, constraints) {
@@ -2434,7 +2659,9 @@ class _OverviewTab extends StatelessWidget {
                         Text(
                           'Measured distance: ${tankDistance.toStringAsFixed(1)} cm',
                           style: TextStyle(
-                            color: Theme.of(context).colorScheme.onSurfaceVariant,
+                            color: Theme.of(
+                              context,
+                            ).colorScheme.onSurfaceVariant,
                           ),
                         ),
                       ],
@@ -2526,21 +2753,21 @@ class _OverviewTab extends StatelessWidget {
                 children: [
                   Expanded(
                     child: _SummaryStatCard(
-                      title: 'Water valve',
+                      title: 'Any water pump',
                       value: (data['waterValveOpen'] ?? false) == true
                           ? 'Open'
                           : 'Closed',
-                      subtitle: 'Channel 1',
+                      subtitle: 'Zone aggregate',
                     ),
                   ),
                   const SizedBox(width: 12),
                   Expanded(
                     child: _SummaryStatCard(
-                      title: 'Nutrient valve',
+                      title: 'Any nutrient pump',
                       value: (data['nutrientValveOpen'] ?? false) == true
                           ? 'Open'
                           : 'Closed',
-                      subtitle: 'Channel 2',
+                      subtitle: 'Zone aggregate',
                     ),
                   ),
                 ],
@@ -2554,7 +2781,7 @@ class _OverviewTab extends StatelessWidget {
               ),
               const SizedBox(height: 4),
               Text(
-                'Tap a tile to run one pump for ${(manualPumpDurationMs / 1000).toStringAsFixed(0)} seconds.',
+                'Water buttons run for ${(manualWaterDurationMs / 1000).toStringAsFixed(0)}s; nutrient buttons run for ${(manualNutrientDurationMs / 1000).toStringAsFixed(0)}s.',
                 style: TextStyle(
                   color: Theme.of(context).colorScheme.onSurfaceVariant,
                 ),
@@ -2742,8 +2969,10 @@ class _ZonesTab extends StatelessWidget {
                   label: 'Humidity',
                   value: _asDouble(zone['humidityPct']),
                   display: '${zone['humidityPct'] ?? '--'} %',
-                  progress: ((_asDouble(zone['humidityPct']) ?? 0) / 100)
-                      .clamp(0, 1),
+                  progress: ((_asDouble(zone['humidityPct']) ?? 0) / 100).clamp(
+                    0,
+                    1,
+                  ),
                   color: const Color(0xFF3B82F6),
                 ),
                 const SizedBox(height: 16),
@@ -2810,6 +3039,27 @@ class _ZonesTab extends StatelessWidget {
                     ],
                   ),
                 ),
+                const SizedBox(height: 12),
+                _DetailRow(
+                  label: 'Water pumps',
+                  value: (zone['waterPumpOpen'] ?? false) == true
+                      ? 'Running'
+                      : 'Stopped',
+                ),
+                _DetailRow(
+                  label: 'Nutrient pump',
+                  value: (zone['nutrientPumpOpen'] ?? false) == true
+                      ? 'Running'
+                      : 'Stopped',
+                ),
+                _DetailRow(
+                  label: 'Last water pulse',
+                  value: _pulseText(zone['lastWaterPulseMs']),
+                ),
+                _DetailRow(
+                  label: 'Last nutrient pulse',
+                  value: _pulseText(zone['lastNutrientPulseMs']),
+                ),
               ],
             ),
           ),
@@ -2824,15 +3074,31 @@ class _DeviceTab extends StatelessWidget {
     required this.device,
     required this.info,
     required this.status,
+    required this.settings,
+    required this.settingsRequestInFlight,
+    required this.manualWaterDurationMs,
+    required this.manualNutrientDurationMs,
     required this.onUpdateControllerIp,
     required this.onResetWifi,
+    required this.onWaterPulseProfileChanged,
+    required this.onNutrientPulseProfileChanged,
+    required this.onManualWaterDurationChanged,
+    required this.onManualNutrientDurationChanged,
   });
 
   final DeviceRecord device;
   final Map<String, dynamic>? info;
   final Map<String, dynamic>? status;
+  final Map<String, dynamic>? settings;
+  final bool settingsRequestInFlight;
+  final int manualWaterDurationMs;
+  final int manualNutrientDurationMs;
   final Future<void> Function() onUpdateControllerIp;
   final Future<void> Function() onResetWifi;
+  final Future<void> Function(String profileId) onWaterPulseProfileChanged;
+  final Future<void> Function(String profileId) onNutrientPulseProfileChanged;
+  final Future<void> Function(int durationMs) onManualWaterDurationChanged;
+  final Future<void> Function(int durationMs) onManualNutrientDurationChanged;
 
   @override
   Widget build(BuildContext context) {
@@ -2843,6 +3109,15 @@ class _DeviceTab extends StatelessWidget {
         (status?['lastTelemetrySampleAtMs'] as num?)?.toInt() ?? 0;
     final phaseRemainingMs =
         (status?['phaseRemainingMs'] as num?)?.toInt() ?? 0;
+    final pumpProfiles = _pumpProfilesFromSettings(settings);
+    final waterPulseProfile = _profileIdOrDefault(
+      '${settings?['waterPulseProfile'] ?? 'balanced'}',
+      pumpProfiles,
+    );
+    final nutrientPulseProfile = _profileIdOrDefault(
+      '${settings?['nutrientPulseProfile'] ?? 'balanced'}',
+      pumpProfiles,
+    );
 
     return ListView(
       padding: const EdgeInsets.all(16),
@@ -2936,30 +3211,237 @@ class _DeviceTab extends StatelessWidget {
           ),
         ),
         const SizedBox(height: 16),
+        _SectionCard(
+          child: Padding(
+            padding: const EdgeInsets.all(4),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const _SectionHeader(
+                  title: 'Pump settings',
+                  subtitle:
+                      'Automatic profiles affect controller dosing. Manual presets affect tap-to-run buttons only.',
+                ),
+                const SizedBox(height: 16),
+                _ProfileSlider(
+                  title: 'Automatic water profile',
+                  subtitle:
+                      'Adjusts non-critical automatic watering pulses. Critical dry soil still uses the max safe pulse.',
+                  profiles: pumpProfiles,
+                  selectedProfileId: waterPulseProfile,
+                  enabled: !settingsRequestInFlight,
+                  onChanged: onWaterPulseProfileChanged,
+                ),
+                const SizedBox(height: 16),
+                _ProfileSlider(
+                  title: 'Automatic nutrient profile',
+                  subtitle:
+                      'Adjusts low nutrient correction from 600 to 799 ppm. Below 600 ppm still uses the max safe pulse.',
+                  profiles: pumpProfiles,
+                  selectedProfileId: nutrientPulseProfile,
+                  enabled: !settingsRequestInFlight,
+                  onChanged: onNutrientPulseProfileChanged,
+                ),
+                const Divider(height: 28),
+                _DurationPresetSelector(
+                  title: 'Manual water run time',
+                  selectedDurationMs: manualWaterDurationMs,
+                  optionsMs: kManualWaterDurationOptionsMs,
+                  onChanged: onManualWaterDurationChanged,
+                ),
+                const SizedBox(height: 12),
+                _DurationPresetSelector(
+                  title: 'Manual nutrient run time',
+                  selectedDurationMs: manualNutrientDurationMs,
+                  optionsMs: kManualNutrientDurationOptionsMs,
+                  onChanged: onManualNutrientDurationChanged,
+                ),
+              ],
+            ),
+          ),
+        ),
         const SizedBox(height: 16),
         _SectionCard(
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-                const _SectionHeader(
-                  title: 'Recovery',
-                  subtitle:
-                      'Fix IP changes or set up Wi-Fi again when needed',
-                ),
-                const SizedBox(height: 12),
-                OutlinedButton.icon(
-                  onPressed: () => unawaited(onUpdateControllerIp()),
-                  icon: const Icon(Icons.edit_location_alt_outlined),
-                  label: const Text('Update controller IP'),
-                ),
-                const SizedBox(height: 8),
-                FilledButton.tonalIcon(
-                  onPressed: () => unawaited(onResetWifi()),
-                  icon: const Icon(Icons.restart_alt),
-                  label: const Text('Set Up Wi-Fi Again'),
-                ),
-              ],
+              const _SectionHeader(
+                title: 'Recovery',
+                subtitle: 'Fix IP changes or set up Wi-Fi again when needed',
+              ),
+              const SizedBox(height: 12),
+              OutlinedButton.icon(
+                onPressed: () => unawaited(onUpdateControllerIp()),
+                icon: const Icon(Icons.edit_location_alt_outlined),
+                label: const Text('Update controller IP'),
+              ),
+              const SizedBox(height: 8),
+              FilledButton.tonalIcon(
+                onPressed: () => unawaited(onResetWifi()),
+                icon: const Icon(Icons.restart_alt),
+                label: const Text('Set Up Wi-Fi Again'),
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _ProfileSlider extends StatefulWidget {
+  const _ProfileSlider({
+    required this.title,
+    required this.subtitle,
+    required this.profiles,
+    required this.selectedProfileId,
+    required this.enabled,
+    required this.onChanged,
+  });
+
+  final String title;
+  final String subtitle;
+  final List<PumpProfileOption> profiles;
+  final String selectedProfileId;
+  final bool enabled;
+  final Future<void> Function(String profileId) onChanged;
+
+  @override
+  State<_ProfileSlider> createState() => _ProfileSliderState();
+}
+
+class _ProfileSliderState extends State<_ProfileSlider> {
+  late double _value;
+
+  @override
+  void initState() {
+    super.initState();
+    _value = _indexForProfile().toDouble();
+  }
+
+  @override
+  void didUpdateWidget(covariant _ProfileSlider oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.selectedProfileId != widget.selectedProfileId ||
+        oldWidget.profiles != widget.profiles) {
+      _value = _indexForProfile().toDouble();
+    }
+  }
+
+  int _indexForProfile() {
+    final index = widget.profiles.indexWhere(
+      (profile) => profile.id == widget.selectedProfileId,
+    );
+    if (index >= 0) {
+      return index;
+    }
+    return widget.profiles.length > 2 ? 2 : widget.profiles.length - 1;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final profiles = widget.profiles;
+    final rounded = _value.round();
+    final index = rounded < 0
+        ? 0
+        : (rounded >= profiles.length ? profiles.length - 1 : rounded);
+    final selected = profiles[index];
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          widget.title,
+          style: Theme.of(
+            context,
+          ).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700),
+        ),
+        const SizedBox(height: 4),
+        Text(
+          widget.subtitle,
+          style: TextStyle(
+            color: Theme.of(context).colorScheme.onSurfaceVariant,
+          ),
+        ),
+        Slider(
+          value: _value,
+          min: 0,
+          max: (profiles.length - 1).toDouble(),
+          divisions: profiles.length - 1,
+          label: selected.label,
+          onChanged: widget.enabled
+              ? (value) {
+                  setState(() {
+                    _value = value;
+                  });
+                }
+              : null,
+          onChangeEnd: widget.enabled
+              ? (value) {
+                  final rounded = value.round();
+                  final nextIndex = rounded < 0
+                      ? 0
+                      : (rounded >= profiles.length
+                            ? profiles.length - 1
+                            : rounded);
+                  final next = profiles[nextIndex];
+                  unawaited(widget.onChanged(next.id));
+                }
+              : null,
+        ),
+        Row(
+          children: [
+            Expanded(
+              child: Text(
+                selected.label,
+                style: const TextStyle(fontWeight: FontWeight.w700),
+              ),
             ),
+            Text('${(selected.multiplier * 100).round()}% pulse'),
+          ],
+        ),
+      ],
+    );
+  }
+}
+
+class _DurationPresetSelector extends StatelessWidget {
+  const _DurationPresetSelector({
+    required this.title,
+    required this.selectedDurationMs,
+    required this.optionsMs,
+    required this.onChanged,
+  });
+
+  final String title;
+  final int selectedDurationMs;
+  final List<int> optionsMs;
+  final Future<void> Function(int durationMs) onChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          title,
+          style: Theme.of(
+            context,
+          ).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700),
+        ),
+        const SizedBox(height: 8),
+        Wrap(
+          spacing: 8,
+          runSpacing: 8,
+          children: [
+            for (final option in optionsMs)
+              ChoiceChip(
+                label: Text('${option ~/ 1000}s'),
+                selected: selectedDurationMs == option,
+                onSelected: selectedDurationMs == option
+                    ? null
+                    : (_) => unawaited(onChanged(option)),
+              ),
+          ],
         ),
       ],
     );
@@ -4120,6 +4602,37 @@ double? _asDouble(dynamic value) {
   return null;
 }
 
+List<PumpProfileOption> _pumpProfilesFromSettings(
+  Map<String, dynamic>? settings,
+) {
+  final rawProfiles = settings?['profiles'];
+  if (rawProfiles is! List) {
+    return kDefaultPumpProfiles;
+  }
+
+  final profiles = <PumpProfileOption>[];
+  for (final raw in rawProfiles) {
+    if (raw is! Map<String, dynamic>) {
+      continue;
+    }
+    final id = '${raw['id'] ?? ''}';
+    final label = '${raw['label'] ?? ''}';
+    final multiplier = _asDouble(raw['multiplier']);
+    if (id.isEmpty || label.isEmpty || multiplier == null) {
+      continue;
+    }
+    profiles.add(
+      PumpProfileOption(id: id, label: label, multiplier: multiplier),
+    );
+  }
+  return profiles.isEmpty ? kDefaultPumpProfiles : profiles;
+}
+
+String _profileIdOrDefault(String profileId, List<PumpProfileOption> profiles) {
+  final exists = profiles.any((profile) => profile.id == profileId);
+  return exists ? profileId : 'balanced';
+}
+
 double? _averageZoneValue(List<dynamic> zones, String key) {
   double total = 0;
   int count = 0;
@@ -4168,6 +4681,14 @@ String _sampleAgeText(dynamic sampleAgeMs) {
   }
   final minutes = seconds ~/ 60;
   return '${minutes}m ago';
+}
+
+String _pulseText(dynamic pulseMs) {
+  final value = _asDouble(pulseMs);
+  if (value == null || value <= 0) {
+    return 'None';
+  }
+  return '${(value / 1000).toStringAsFixed(0)}s';
 }
 
 double _freshnessValue(dynamic sampleAgeMs) {
@@ -4267,6 +4788,10 @@ String _manualPumpLabelFromId(String pumpId) {
     }
   }
   return pumpId;
+}
+
+bool _manualPumpIsWaterId(String pumpId) {
+  return pumpId.contains('Water');
 }
 
 String _manualPumpShortLabel(String pumpId) {
