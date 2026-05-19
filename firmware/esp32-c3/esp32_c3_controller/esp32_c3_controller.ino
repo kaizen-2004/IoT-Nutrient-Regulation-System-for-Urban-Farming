@@ -57,9 +57,13 @@ void startProvisioningMode(const char *reason);
 void stopProvisioningMode();
 void pollSetupResetButton();
 void writePumpGroupPins(const uint8_t *pins, uint8_t count, bool open);
+void writePumpPin(uint8_t pin, bool open);
 void setupPumpGroupPins(const uint8_t *pins, uint8_t count);
 bool relayPinActiveHigh(uint8_t pin);
 uint8_t countAssignedPumpPins(const uint8_t *pins, uint8_t count);
+void setZoneWaterPump(uint8_t zone, bool open);
+void setZoneNutrientPump(uint8_t zone, bool open);
+void runZonePumpDurations(uint32_t *durationsMs, bool nutrient, const char *pumpName, uint32_t cycleStartMs);
 void enforceActuationStartGap();
 void noteActuationStarted();
 void enforceStartupValveOffWindow();
@@ -71,6 +75,7 @@ void closeAllValves();
 void setAlertMessage(const String &message);
 String buildStatusJSON();
 String buildInfoJSON();
+String buildSettingsJSON();
 String buildProvisioningInfoJSON();
 String buildProvisioningResultJSON();
 String buildHealthJSON();
@@ -90,6 +95,9 @@ const char *manualPumpStateText(uint8_t index, uint32_t now);
 void setManualPumpPin(uint8_t index, bool open);
 void updateManualPumpRunState();
 void handleManualPump();
+void handleSettings();
+void loadControllerSettings();
+bool saveControllerSettings();
 #if ENABLE_LOCAL_API_SERVER
 void setupMDNSService();
 void ensureMDNSService();
@@ -126,7 +134,6 @@ const float MIN_MOISTURE_FOR_NUTRIENT_PCT = 20.0f;
 const float DEMAND_BLEND_MAX_WEIGHT = 0.70f;
 const float DEMAND_BLEND_AVG_WEIGHT = 0.30f;
 const uint32_t CLIMATE_SUPPORT_WATER_PULSE_MS = 30UL * 1000UL;
-const uint32_t REDUCED_NUTRIENT_PULSE_MS = 10UL * 1000UL;
 const float SOIL_MOISTURE_CRITICAL_DRY_PCT = 20.0f;
 const float SOIL_MOISTURE_LOW_PCT = 30.0f;
 const float SOIL_MOISTURE_OPTIMAL_HIGH_PCT = 45.0f;
@@ -180,9 +187,11 @@ const uint8_t NUTRIENT_PUMP_PINS[NUTRIENT_PUMP_PIN_COUNT] = {
 const uint8_t MANUAL_PUMP_COUNT = 6;
 const uint32_t MANUAL_MIN_PULSE_MS = 3000UL;
 const uint32_t MANUAL_MAX_PULSE_MS = 15000UL;
+const uint32_t MANUAL_NUTRIENT_MAX_PULSE_MS = 10000UL;
 const uint32_t MANUAL_COOLDOWN_MS = 10000UL;
 const uint32_t MANUAL_RATE_LIMIT_MS = 1500UL;
 const uint8_t NO_ACTIVE_MANUAL_PUMP = 255;
+const uint8_t WATER_PUMPS_PER_ZONE = 2;
 const uint8_t RS485_TX_PIN = 21;
 const uint8_t RS485_RX_PIN = 20;
 const uint32_t RS485_BAUD = 19200;
@@ -214,6 +223,29 @@ const char *MDNS_HOSTNAME = "plantcare";
 const char *WIFI_PREFS_NAMESPACE = "wifi";
 const char *WIFI_PREFS_SSID_KEY = "ssid";
 const char *WIFI_PREFS_PASSWORD_KEY = "password";
+const char *SETTINGS_PREFS_NAMESPACE = "controller";
+const char *WATER_PROFILE_PREFS_KEY = "waterProfile";
+const char *NUTRIENT_PROFILE_PREFS_KEY = "nutriProfile";
+const uint8_t PULSE_PROFILE_COUNT = 5;
+const uint8_t PULSE_PROFILE_BALANCED_INDEX = 2;
+const char *PULSE_PROFILE_IDS[PULSE_PROFILE_COUNT] = {
+    "water_saving",
+    "gentle",
+    "balanced",
+    "fast",
+    "max_pumping"};
+const char *PULSE_PROFILE_LABELS[PULSE_PROFILE_COUNT] = {
+    "Water Saving",
+    "Gentle",
+    "Balanced",
+    "Fast",
+    "Max Pumping"};
+const float PULSE_PROFILE_MULTIPLIERS[PULSE_PROFILE_COUNT] = {
+    0.50f,
+    0.75f,
+    1.00f,
+    1.25f,
+    1.50f};
 const char *PROVISIONING_AP_PREFIX = "NutrientReg-Setup";
 const IPAddress PROVISIONING_AP_IP(192, 168, 4, 1);
 const IPAddress PROVISIONING_AP_GATEWAY(192, 168, 4, 1);
@@ -242,6 +274,7 @@ const bool SMTP_ALLOW_INSECURE_TLS = true;
 LiquidCrystal_I2C lcd(LCD_I2C_ADDRESS, LCD_COLS, LCD_ROWS);
 WebServer apiServer(80);
 Preferences wifiPrefs;
+Preferences settingsPrefs;
 #if ENABLE_LOCAL_API_SERVER
 WebServer webServer(80);
 #endif
@@ -275,13 +308,21 @@ char lastLCDLines[LCD_ROWS][LCD_COLS + 1] = {{0}};
 
 uint32_t lastWaterPulseMs = 0;
 uint32_t lastNutrientPulseMs = 0;
+uint32_t lastZoneWaterPulseMs[NUM_ZONES] = {0, 0};
+uint32_t lastZoneNutrientPulseMs[NUM_ZONES] = {0, 0};
 uint32_t lastCycleElapsedMs = 0;
 uint32_t lastCycleCompletedAtMs = 0;
 uint32_t lastTelemetrySampleAtMs = 0;
 bool waterValveOpen = false;
 bool nutrientValveOpen = false;
+bool zoneWaterPumpOpen[NUM_ZONES] = {false, false};
+bool zoneNutrientPumpOpen[NUM_ZONES] = {false, false};
+bool lastZoneNutrientBlockedByDrySoil[NUM_ZONES] = {false, false};
+bool lastZoneNutrientHighLockout[NUM_ZONES] = {false, false};
 uint32_t waterValveOpenedAtMs = 0;
 uint32_t nutrientValveOpenedAtMs = 0;
+uint32_t zoneWaterPumpOpenedAtMs[NUM_ZONES] = {0, 0};
+uint32_t zoneNutrientPumpOpenedAtMs[NUM_ZONES] = {0, 0};
 uint32_t lastActuationStartAtMs = 0;
 uint32_t startupForceOffUntilMs = 0;
 uint32_t lastStartupForceOffAtMs = 0;
@@ -314,6 +355,8 @@ uint32_t lastMDNSRetryAt = 0;
 uint32_t lastEmailSentAt = 0;
 bool lastCycleCriticalNutrientLockout = false;
 bool lastWiFiConnected = false;
+uint8_t waterPulseProfileIndex = PULSE_PROFILE_BALANCED_INDEX;
+uint8_t nutrientPulseProfileIndex = PULSE_PROFILE_BALANCED_INDEX;
 uint32_t setupResetPressedAt = 0;
 bool setupResetHandledForCurrentPress = false;
 char unoFrameBuffer[192] = {0};
@@ -1304,7 +1347,7 @@ const char DASHBOARD_HTML[] PROGMEM = R"HTML(
             <strong id="spotNutrient">--</strong>
           </div>
           <div class="spot-stat">
-            <span>Water tank</span>
+            <span>Clean water tank</span>
             <strong id="spotTank">--</strong>
           </div>
           <div class="spot-stat">
@@ -1348,7 +1391,7 @@ const char DASHBOARD_HTML[] PROGMEM = R"HTML(
           <div class="criteria-box">
             <p class="criteria-title">Plant Food Guide (ppm)</p>
             <div class="criteria-list">
-              <div class="criteria-row"><span>Below 600</span><strong>Very low (unsafe)</strong></div>
+              <div class="criteria-row"><span>Below 600</span><strong>Very low (dosing needed)</strong></div>
               <div class="criteria-row"><span>600 to 799</span><strong>Low</strong></div>
               <div class="criteria-row"><span>800 to 1200</span><strong>Good range</strong></div>
               <div class="criteria-row"><span>1201 to 1400</span><strong>A little high</strong></div>
@@ -1528,6 +1571,10 @@ const char DASHBOARD_HTML[] PROGMEM = R"HTML(
           return 'Low';
         case 'slightly_high':
           return 'A little high';
+        case 'severely_low':
+          return 'Very low';
+        case 'critical_high':
+          return 'Too high';
         case 'critical_imbalance':
           return 'Unsafe';
         default:
@@ -1555,7 +1602,7 @@ const char DASHBOARD_HTML[] PROGMEM = R"HTML(
         return '--';
       }
       if (n < 600) {
-        return 'Very low (unsafe)';
+        return 'Very low (dosing needed)';
       }
       if (n < 800) {
         return 'Low';
@@ -1664,6 +1711,8 @@ const char DASHBOARD_HTML[] PROGMEM = R"HTML(
         case 'optimal':
           return 'good';
         case 'critical_dry':
+        case 'severely_low':
+        case 'critical_high':
         case 'critical_imbalance':
           return 'alert';
         case 'slightly_dry':
@@ -2217,10 +2266,10 @@ const char DASHBOARD_HTML[] PROGMEM = R"HTML(
 
       if (tankLow) {
         tankAlertEl.className = 'alert show';
-        tankAlertEl.textContent = 'Water tank status is ' + tankLevel + '. Please refill to continue normal watering.';
+        tankAlertEl.textContent = 'Clean water tank status is ' + tankLevel + '. Please refill to continue normal watering.';
       } else if (status.criticalNutrientLockout) {
         tankAlertEl.className = 'alert show';
-        tankAlertEl.textContent = 'Plant food level is unsafe. Automatic feeding is paused for safety.';
+        tankAlertEl.textContent = 'A zone plant food level is too high. Feeding is paused for that zone.';
       } else {
         tankAlertEl.className = 'alert';
         tankAlertEl.textContent = '';
@@ -2967,6 +3016,91 @@ uint32_t scaleDuration(uint32_t minMs, uint32_t maxMs, float ratio)
   return minMs + (uint32_t)((maxMs - minMs) * ratio);
 }
 
+int8_t pulseProfileIndexFromId(const String &id)
+{
+  for (uint8_t i = 0; i < PULSE_PROFILE_COUNT; i++)
+  {
+    if (id == PULSE_PROFILE_IDS[i])
+    {
+      return (int8_t)i;
+    }
+  }
+  return -1;
+}
+
+const char *pulseProfileId(uint8_t index)
+{
+  return (index < PULSE_PROFILE_COUNT) ? PULSE_PROFILE_IDS[index] : PULSE_PROFILE_IDS[PULSE_PROFILE_BALANCED_INDEX];
+}
+
+const char *pulseProfileLabel(uint8_t index)
+{
+  return (index < PULSE_PROFILE_COUNT) ? PULSE_PROFILE_LABELS[index] : PULSE_PROFILE_LABELS[PULSE_PROFILE_BALANCED_INDEX];
+}
+
+float pulseProfileMultiplier(uint8_t index)
+{
+  return (index < PULSE_PROFILE_COUNT) ? PULSE_PROFILE_MULTIPLIERS[index] : PULSE_PROFILE_MULTIPLIERS[PULSE_PROFILE_BALANCED_INDEX];
+}
+
+uint32_t applyPulseProfile(uint32_t durationMs, uint32_t maxMs, uint8_t profileIndex)
+{
+  if (durationMs == 0)
+  {
+    return 0;
+  }
+
+  float adjusted = (float)durationMs * pulseProfileMultiplier(profileIndex);
+  if (adjusted < 1.0f)
+  {
+    adjusted = 1.0f;
+  }
+  if (adjusted > (float)maxMs)
+  {
+    adjusted = (float)maxMs;
+  }
+  return (uint32_t)adjusted;
+}
+
+void loadControllerSettings()
+{
+  waterPulseProfileIndex = PULSE_PROFILE_BALANCED_INDEX;
+  nutrientPulseProfileIndex = PULSE_PROFILE_BALANCED_INDEX;
+
+  if (!settingsPrefs.begin(SETTINGS_PREFS_NAMESPACE, true))
+  {
+    return;
+  }
+
+  String waterProfile = settingsPrefs.getString(WATER_PROFILE_PREFS_KEY, pulseProfileId(PULSE_PROFILE_BALANCED_INDEX));
+  String nutrientProfile = settingsPrefs.getString(NUTRIENT_PROFILE_PREFS_KEY, pulseProfileId(PULSE_PROFILE_BALANCED_INDEX));
+  settingsPrefs.end();
+
+  int8_t waterIndex = pulseProfileIndexFromId(waterProfile);
+  int8_t nutrientIndex = pulseProfileIndexFromId(nutrientProfile);
+  if (waterIndex >= 0)
+  {
+    waterPulseProfileIndex = (uint8_t)waterIndex;
+  }
+  if (nutrientIndex >= 0)
+  {
+    nutrientPulseProfileIndex = (uint8_t)nutrientIndex;
+  }
+}
+
+bool saveControllerSettings()
+{
+  if (!settingsPrefs.begin(SETTINGS_PREFS_NAMESPACE, false))
+  {
+    return false;
+  }
+
+  bool ok = settingsPrefs.putString(WATER_PROFILE_PREFS_KEY, pulseProfileId(waterPulseProfileIndex)) > 0;
+  ok = ok && settingsPrefs.putString(NUTRIENT_PROFILE_PREFS_KEY, pulseProfileId(nutrientPulseProfileIndex)) > 0;
+  settingsPrefs.end();
+  return ok;
+}
+
 float smoothReading(float previous, float current, float alpha)
 {
   if (alpha <= 0.0f)
@@ -2987,7 +3121,12 @@ float nutrientPpmFromNPK(const NPK &npk)
 
 bool isNutrientCritical(float ppm)
 {
-  return (ppm < NUTRIENT_CRITICAL_LOW_PPM) || (ppm > NUTRIENT_CRITICAL_HIGH_PPM);
+  return ppm > NUTRIENT_CRITICAL_HIGH_PPM;
+}
+
+bool isNutrientSeverelyLow(float ppm)
+{
+  return ppm < NUTRIENT_CRITICAL_LOW_PPM;
 }
 
 bool isNutrientLowBand(float ppm)
@@ -3074,9 +3213,13 @@ const char *tankLevelText(float distanceCm)
 
 const char *nutrientBandText(float nutrientPpm)
 {
+  if (isNutrientSeverelyLow(nutrientPpm))
+  {
+    return "severely_low";
+  }
   if (isNutrientCritical(nutrientPpm))
   {
-    return "critical_imbalance";
+    return "critical_high";
   }
   if (isNutrientLowBand(nutrientPpm))
   {
@@ -3102,7 +3245,7 @@ void updateThresholdNotifications()
     float nutrientPpm = nutrientPpmFromNPK(r.npk);
 
     bool moistureLow = r.moisturePct < SOIL_MOISTURE_LOW_PCT;
-    bool nutrientLow = isNutrientLowBand(nutrientPpm);
+    bool nutrientLow = isNutrientSeverelyLow(nutrientPpm) || isNutrientLowBand(nutrientPpm);
     bool nutrientHigh = isNutrientSlightlyHighBand(nutrientPpm);
     bool nutrientCritical = isNutrientCritical(nutrientPpm);
 
@@ -3121,11 +3264,11 @@ void updateThresholdNotifications()
     }
     if (nutrientHigh && !prevNutrientHighState[zone])
     {
-      setAlertMessage(String("Zone ") + String(zone + 1) + ": nutrient high. Dosing reduced.");
+      setAlertMessage(String("Zone ") + String(zone + 1) + ": nutrient high. Dosing paused for this zone.");
     }
     if (nutrientCritical && !prevNutrientCriticalState[zone])
     {
-      setAlertMessage(String("Zone ") + String(zone + 1) + ": critical nutrient imbalance. Check solution.");
+      setAlertMessage(String("Zone ") + String(zone + 1) + ": nutrient too high. Check solution.");
     }
 
     prevMoistureLowState[zone] = moistureLow;
@@ -3165,15 +3308,19 @@ void writePumpGroupPins(const uint8_t *pins, uint8_t count, bool open)
 {
   for (uint8_t i = 0; i < count; i++)
   {
-    uint8_t pin = pins[i];
-    if (pin == UNASSIGNED_PUMP_PIN)
-    {
-      continue;
-    }
-    bool activeHigh = relayPinActiveHigh(pin);
-    bool level = open ? activeHigh : !activeHigh;
-    digitalWrite(pin, level ? HIGH : LOW);
+    writePumpPin(pins[i], open);
   }
+}
+
+void writePumpPin(uint8_t pin, bool open)
+{
+  if (pin == UNASSIGNED_PUMP_PIN)
+  {
+    return;
+  }
+  bool activeHigh = relayPinActiveHigh(pin);
+  bool level = open ? activeHigh : !activeHigh;
+  digitalWrite(pin, level ? HIGH : LOW);
 }
 
 bool relayPinActiveHigh(uint8_t pin)
@@ -3191,7 +3338,11 @@ void setupPumpGroupPins(const uint8_t *pins, uint8_t count)
     {
       continue;
     }
+    bool activeHigh = relayPinActiveHigh(pin);
+    bool offLevel = !activeHigh;
+    digitalWrite(pin, offLevel ? HIGH : LOW);
     pinMode(pin, OUTPUT);
+    digitalWrite(pin, offLevel ? HIGH : LOW);
   }
 }
 
@@ -3206,6 +3357,82 @@ uint8_t countAssignedPumpPins(const uint8_t *pins, uint8_t count)
     }
   }
   return assigned;
+}
+
+void refreshAggregatePumpOpenState()
+{
+  bool anyWaterOpen = false;
+  bool anyNutrientOpen = false;
+  for (uint8_t zone = 0; zone < NUM_ZONES; zone++)
+  {
+    anyWaterOpen = anyWaterOpen || zoneWaterPumpOpen[zone];
+    anyNutrientOpen = anyNutrientOpen || zoneNutrientPumpOpen[zone];
+  }
+
+  uint32_t now = millis();
+  bool wasWaterOpen = waterValveOpen;
+  bool wasNutrientOpen = nutrientValveOpen;
+  waterValveOpen = anyWaterOpen;
+  nutrientValveOpen = anyNutrientOpen;
+
+  if (waterValveOpen && !wasWaterOpen)
+  {
+    waterValveOpenedAtMs = now;
+  }
+  else if (!waterValveOpen)
+  {
+    waterValveOpenedAtMs = 0;
+  }
+
+  if (nutrientValveOpen && !wasNutrientOpen)
+  {
+    nutrientValveOpenedAtMs = now;
+  }
+  else if (!nutrientValveOpen)
+  {
+    nutrientValveOpenedAtMs = 0;
+  }
+}
+
+void setZoneWaterPump(uint8_t zone, bool open)
+{
+  if (zone >= NUM_ZONES)
+  {
+    return;
+  }
+
+  uint8_t startIndex = zone * WATER_PUMPS_PER_ZONE;
+  for (uint8_t i = 0; i < WATER_PUMPS_PER_ZONE; i++)
+  {
+    writePumpPin(WATER_PUMP_PINS[startIndex + i], open);
+  }
+
+  bool changed = zoneWaterPumpOpen[zone] != open;
+  zoneWaterPumpOpen[zone] = open;
+  zoneWaterPumpOpenedAtMs[zone] = open ? millis() : 0;
+  refreshAggregatePumpOpenState();
+  if (changed && phaseStartedAt > 0)
+  {
+    setAlertMessage(String("Zone ") + String(zone + 1) + (open ? ": water pumps running." : ": water pumps stopped."));
+  }
+}
+
+void setZoneNutrientPump(uint8_t zone, bool open)
+{
+  if (zone >= NUM_ZONES)
+  {
+    return;
+  }
+
+  writePumpPin(NUTRIENT_PUMP_PINS[zone], open);
+  bool changed = zoneNutrientPumpOpen[zone] != open;
+  zoneNutrientPumpOpen[zone] = open;
+  zoneNutrientPumpOpenedAtMs[zone] = open ? millis() : 0;
+  refreshAggregatePumpOpenState();
+  if (changed && phaseStartedAt > 0)
+  {
+    setAlertMessage(String("Zone ") + String(zone + 1) + (open ? ": nutrient dosing running." : ": nutrient dosing stopped."));
+  }
 }
 
 const char *manualPumpIdByIndex(uint8_t index)
@@ -3386,16 +3613,21 @@ void enforceActuationSafetyWatchdog()
 {
   uint32_t now = millis();
 
-  if (waterValveOpen && waterValveOpenedAtMs != 0 && (uint32_t)(now - waterValveOpenedAtMs) > MAX_WATER_VALVE_ON_MS)
+  for (uint8_t zone = 0; zone < NUM_ZONES; zone++)
   {
-    setValve(WATER_VALVE_PIN, false);
-    setAlertMessage("Safety watchdog: water valve forced off.");
-  }
+    if (zoneWaterPumpOpen[zone] && zoneWaterPumpOpenedAtMs[zone] != 0 &&
+        (uint32_t)(now - zoneWaterPumpOpenedAtMs[zone]) > MAX_WATER_VALVE_ON_MS)
+    {
+      setZoneWaterPump(zone, false);
+      setAlertMessage(String("Safety watchdog: zone ") + String(zone + 1) + " water pumps forced off.");
+    }
 
-  if (nutrientValveOpen && nutrientValveOpenedAtMs != 0 && (uint32_t)(now - nutrientValveOpenedAtMs) > MAX_NUTRIENT_VALVE_ON_MS)
-  {
-    setValve(NUTRIENT_VALVE_PIN, false);
-    setAlertMessage("Safety watchdog: nutrient valve forced off.");
+    if (zoneNutrientPumpOpen[zone] && zoneNutrientPumpOpenedAtMs[zone] != 0 &&
+        (uint32_t)(now - zoneNutrientPumpOpenedAtMs[zone]) > MAX_NUTRIENT_VALVE_ON_MS)
+    {
+      setZoneNutrientPump(zone, false);
+      setAlertMessage(String("Safety watchdog: zone ") + String(zone + 1) + " nutrient pump forced off.");
+    }
   }
 
   if (activeManualPumpIndex != NO_ACTIVE_MANUAL_PUMP &&
@@ -3450,8 +3682,11 @@ void setValve(uint8_t pin, bool open)
 
 void closeAllValves()
 {
-  setValve(WATER_VALVE_PIN, false);
-  setValve(NUTRIENT_VALVE_PIN, false);
+  for (uint8_t zone = 0; zone < NUM_ZONES; zone++)
+  {
+    setZoneWaterPump(zone, false);
+    setZoneNutrientPump(zone, false);
+  }
 }
 
 void runValveFor(uint8_t pin, uint32_t durationMs, const char *valveName)
@@ -3477,6 +3712,117 @@ void runValveFor(uint8_t pin, uint32_t durationMs, const char *valveName)
   }
 
   setValve(pin, false);
+}
+
+void runZonePumpDurations(uint32_t *durationsMs, bool nutrient, const char *pumpName, uint32_t cycleStartMs)
+{
+  bool active[NUM_ZONES] = {false, false};
+  uint32_t startedAt[NUM_ZONES] = {0, 0};
+  uint32_t runMs[NUM_ZONES] = {0, 0};
+
+  for (uint8_t zone = 0; zone < NUM_ZONES; zone++)
+  {
+    if (durationsMs[zone] == 0)
+    {
+      continue;
+    }
+
+    uint32_t elapsed = millis() - cycleStartMs;
+    if (elapsed >= ACTIVE_DURATION_MS)
+    {
+      durationsMs[zone] = 0;
+      continue;
+    }
+
+    uint32_t remaining = ACTIVE_DURATION_MS - elapsed;
+    if (durationsMs[zone] > remaining)
+    {
+      durationsMs[zone] = remaining;
+    }
+    if (durationsMs[zone] == 0)
+    {
+      continue;
+    }
+
+    enforceActuationStartGap();
+    elapsed = millis() - cycleStartMs;
+    if (elapsed >= ACTIVE_DURATION_MS)
+    {
+      durationsMs[zone] = 0;
+      continue;
+    }
+    remaining = ACTIVE_DURATION_MS - elapsed;
+    if (durationsMs[zone] > remaining)
+    {
+      durationsMs[zone] = remaining;
+    }
+    if (durationsMs[zone] == 0)
+    {
+      continue;
+    }
+
+    Serial.printf(
+        "{\"type\":\"actuation\",\"pump\":\"%s\",\"zone\":%u,\"durationMs\":%lu}\n",
+        pumpName,
+        zone + 1,
+        (unsigned long)durationsMs[zone]);
+
+    if (nutrient)
+    {
+      setZoneNutrientPump(zone, true);
+      lastZoneNutrientPulseMs[zone] = durationsMs[zone];
+    }
+    else
+    {
+      setZoneWaterPump(zone, true);
+      lastZoneWaterPulseMs[zone] = durationsMs[zone];
+    }
+    noteActuationStarted();
+    active[zone] = true;
+    startedAt[zone] = millis();
+    runMs[zone] = durationsMs[zone];
+  }
+
+  while (true)
+  {
+    bool anyActive = false;
+    uint32_t now = millis();
+    for (uint8_t zone = 0; zone < NUM_ZONES; zone++)
+    {
+      if (!active[zone])
+      {
+        continue;
+      }
+
+      bool stillOpen = nutrient ? zoneNutrientPumpOpen[zone] : zoneWaterPumpOpen[zone];
+      if (!stillOpen || (uint32_t)(now - startedAt[zone]) >= runMs[zone])
+      {
+        if (nutrient)
+        {
+          setZoneNutrientPump(zone, false);
+        }
+        else
+        {
+          setZoneWaterPump(zone, false);
+        }
+        active[zone] = false;
+        continue;
+      }
+      anyActive = true;
+    }
+
+    if (!anyActive)
+    {
+      break;
+    }
+
+    pollUnoTelemetryLink(false);
+    pollSetupResetButton();
+    maintainWiFiConnection();
+    serviceNetwork();
+    enforceActuationSafetyWatchdog();
+    delay(50);
+  }
 }
 
 bool haveCompleteTelemetry()
@@ -3800,6 +4146,11 @@ uint32_t computeNutrientPulse(const ZoneReadings &r, const ZoneThresholds &t, bo
     return 0;
   }
 
+  if (isNutrientSeverelyLow(nutrientPpm))
+  {
+    return MAX_NUTRIENT_PULSE_MS;
+  }
+
   if (isNutrientLowBand(nutrientPpm))
   {
     float correctionRatio = (NUTRIENT_LOW_PPM - nutrientPpm) / (NUTRIENT_LOW_PPM - NUTRIENT_CRITICAL_LOW_PPM);
@@ -3812,11 +4163,6 @@ uint32_t computeNutrientPulse(const ZoneReadings &r, const ZoneThresholds &t, bo
       correctionRatio = 1.0f;
     }
     return scaleDuration(MIN_NUTRIENT_PULSE_MS, MAX_NUTRIENT_PULSE_MS, correctionRatio);
-  }
-
-  if (isNutrientSlightlyHighBand(nutrientPpm))
-  {
-    return REDUCED_NUTRIENT_PULSE_MS;
   }
 
   return 0;
@@ -3966,7 +4312,7 @@ void renderLCDPage()
 
   if (latestTankLow)
   {
-    snprintf(line1, sizeof(line1), "Water tank is low");
+    snprintf(line1, sizeof(line1), "Clean tank is low");
     snprintf(line2, sizeof(line2), "Refill tank soon");
     snprintf(line3, sizeof(line3), "Watering paused");
     snprintf(line4, sizeof(line4), "IP: %s", currentNetworkIp().c_str());
@@ -3975,7 +4321,7 @@ void renderLCDPage()
   {
     snprintf(line1, sizeof(line1), "%s Cycle %lu", phaseText, (unsigned long)cycleCount);
     snprintf(line2, sizeof(line2), "Time left %s", remainingText);
-    snprintf(line3, sizeof(line3), "%s", latestTankLow ? "Tank low" : "Water tank OK");
+    snprintf(line3, sizeof(line3), "%s", latestTankLow ? "Clean tank low" : "Clean water OK");
     snprintf(line4, sizeof(line4), "%s", currentNetworkIp().c_str());
   }
   else if (currentLCDPage == 1)
@@ -4211,7 +4557,7 @@ String buildStatusJSON()
   uint32_t phaseRemainingMs = (phaseElapsedMs < phaseDurationMs) ? (phaseDurationMs - phaseElapsedMs) : 0;
 
   String json;
-  json.reserve(2800);
+  json.reserve(3600);
   json += "{";
   json += "\"deviceName\":\"";
   json += jsonEscape(DEVICE_NAME);
@@ -4246,6 +4592,9 @@ String buildStatusJSON()
   json += "\"tankLow\":";
   json += latestTankLow ? "true" : "false";
   json += ",";
+  json += "\"cleanWaterTankLow\":";
+  json += latestTankLow ? "true" : "false";
+  json += ",";
   json += "\"tankDistanceCm\":";
   json += isnan(latestTankDistanceCm) ? "null" : String(latestTankDistanceCm, 2);
   json += ",";
@@ -4275,6 +4624,9 @@ String buildStatusJSON()
   json += String(sampleAgeMs);
   json += ",";
   json += "\"criticalNutrientLockout\":";
+  json += lastCycleCriticalNutrientLockout ? "true" : "false";
+  json += ",";
+  json += "\"nutrientHighLockout\":";
   json += lastCycleCriticalNutrientLockout ? "true" : "false";
   json += ",";
   json += "\"waterValveOpen\":";
@@ -4336,6 +4688,18 @@ String buildStatusJSON()
     json += String(i + 1);
     json += ",\"hasData\":";
     json += hasLatestReadings[i] ? "true" : "false";
+    json += ",\"waterPumpOpen\":";
+    json += zoneWaterPumpOpen[i] ? "true" : "false";
+    json += ",\"nutrientPumpOpen\":";
+    json += zoneNutrientPumpOpen[i] ? "true" : "false";
+    json += ",\"lastWaterPulseMs\":";
+    json += String(lastZoneWaterPulseMs[i]);
+    json += ",\"lastNutrientPulseMs\":";
+    json += String(lastZoneNutrientPulseMs[i]);
+    json += ",\"nutrientBlockedByDrySoil\":";
+    json += lastZoneNutrientBlockedByDrySoil[i] ? "true" : "false";
+    json += ",\"nutrientHighLockout\":";
+    json += lastZoneNutrientHighLockout[i] ? "true" : "false";
     if (hasLatestReadings[i])
     {
       float nutrientPpm = nutrientPpmFromNPK(latestReadings[i].npk);
@@ -4420,6 +4784,36 @@ String buildInfoJSON()
   json += "\"uptimeMs\":";
   json += String(millis());
   json += "}";
+  return json;
+}
+
+String buildSettingsJSON()
+{
+  String json;
+  json.reserve(900);
+  json += "{";
+  json += "\"profiles\":[";
+  for (uint8_t i = 0; i < PULSE_PROFILE_COUNT; i++)
+  {
+    if (i > 0)
+    {
+      json += ",";
+    }
+    json += "{";
+    json += "\"id\":\"";
+    json += pulseProfileId(i);
+    json += "\",\"label\":\"";
+    json += pulseProfileLabel(i);
+    json += "\",\"multiplier\":";
+    json += String(pulseProfileMultiplier(i), 2);
+    json += "}";
+  }
+  json += "],";
+  json += "\"waterPulseProfile\":\"";
+  json += pulseProfileId(waterPulseProfileIndex);
+  json += "\",\"nutrientPulseProfile\":\"";
+  json += pulseProfileId(nutrientPulseProfileIndex);
+  json += "\",\"manualPump\":{\"waterOptionsMs\":[3000,5000,10000,15000],\"nutrientOptionsMs\":[3000,5000,10000]}}";
   return json;
 }
 
@@ -4617,6 +5011,69 @@ void handleResetWiFi()
   startProvisioningMode("wifi_reset");
 }
 
+void handleSettings()
+{
+  if (apiServer.method() == HTTP_GET)
+  {
+    sendJsonResponse(200, buildSettingsJSON());
+    return;
+  }
+
+  if (apiServer.method() != HTTP_POST)
+  {
+    sendJsonResponse(405, "{\"error\":\"method_not_allowed\"}");
+    return;
+  }
+
+  String body = apiServer.arg("plain");
+  String waterProfile;
+  String nutrientProfile;
+  bool hasWaterProfile = extractJsonStringField(body, "waterPulseProfile", waterProfile);
+  bool hasNutrientProfile = extractJsonStringField(body, "nutrientPulseProfile", nutrientProfile);
+  if (!hasWaterProfile && !hasNutrientProfile)
+  {
+    sendJsonResponse(400, "{\"error\":\"invalid_payload\"}");
+    return;
+  }
+
+  uint8_t nextWaterProfile = waterPulseProfileIndex;
+  uint8_t nextNutrientProfile = nutrientPulseProfileIndex;
+  if (hasWaterProfile)
+  {
+    int8_t index = pulseProfileIndexFromId(waterProfile);
+    if (index < 0)
+    {
+      sendJsonResponse(400, "{\"error\":\"invalid_water_profile\"}");
+      return;
+    }
+    nextWaterProfile = (uint8_t)index;
+  }
+  if (hasNutrientProfile)
+  {
+    int8_t index = pulseProfileIndexFromId(nutrientProfile);
+    if (index < 0)
+    {
+      sendJsonResponse(400, "{\"error\":\"invalid_nutrient_profile\"}");
+      return;
+    }
+    nextNutrientProfile = (uint8_t)index;
+  }
+
+  uint8_t previousWaterProfile = waterPulseProfileIndex;
+  uint8_t previousNutrientProfile = nutrientPulseProfileIndex;
+  waterPulseProfileIndex = nextWaterProfile;
+  nutrientPulseProfileIndex = nextNutrientProfile;
+  if (!saveControllerSettings())
+  {
+    waterPulseProfileIndex = previousWaterProfile;
+    nutrientPulseProfileIndex = previousNutrientProfile;
+    sendJsonResponse(500, "{\"error\":\"settings_save_failed\"}");
+    return;
+  }
+
+  sendJsonResponse(200, buildSettingsJSON());
+}
+
 void handleManualPump()
 {
   updateManualPumpRunState();
@@ -4662,7 +5119,8 @@ void handleManualPump()
     return;
   }
 
-  if (durationMs < MANUAL_MIN_PULSE_MS || durationMs > MANUAL_MAX_PULSE_MS)
+  uint32_t maxManualDurationMs = manualPumpIsWater((uint8_t)index) ? MANUAL_MAX_PULSE_MS : MANUAL_NUTRIENT_MAX_PULSE_MS;
+  if (durationMs < MANUAL_MIN_PULSE_MS || durationMs > maxManualDurationMs)
   {
     sendJsonResponse(400, "{\"reason\":\"invalid_duration\"}");
     return;
@@ -4676,7 +5134,7 @@ void handleManualPump()
 
   if (manualPumpIsWater((uint8_t)index) && latestTankLow)
   {
-    setAlertMessage(String("Manual watering blocked: tank level is ") + tankLevelText(latestTankDistanceCm) + ". Refill tank.");
+    setAlertMessage(String("Manual watering blocked: clean water tank level is ") + tankLevelText(latestTankDistanceCm) + ". Refill tank.");
     sendJsonResponse(409, "{\"reason\":\"tank_low\"}");
     return;
   }
@@ -4715,6 +5173,9 @@ void setupApiServer()
     apiServer.on("/api/info", HTTP_OPTIONS, handleOptions);
     apiServer.on("/api/status", HTTP_GET, handleStatus);
     apiServer.on("/api/status", HTTP_OPTIONS, handleOptions);
+    apiServer.on("/api/settings", HTTP_GET, handleSettings);
+    apiServer.on("/api/settings", HTTP_POST, handleSettings);
+    apiServer.on("/api/settings", HTTP_OPTIONS, handleOptions);
     apiServer.on("/api/provisioning/info", HTTP_GET, handleProvisioningInfo);
     apiServer.on("/api/provisioning/info", HTTP_OPTIONS, handleOptions);
     apiServer.on("/api/provisioning/configure", HTTP_POST, handleProvisioningConfigure);
@@ -5024,7 +5485,7 @@ String buildInfoJSON()
   json += ",\"humidHighGt\":";
   json += String(HUMIDITY_HUMID_PCT, 1);
   json += "},";
-  json += "\"nutrientPpm\":{\"criticalLowLt\":";
+  json += "\"nutrientPpm\":{\"severeLowLt\":";
   json += String(NUTRIENT_CRITICAL_LOW_PPM, 1);
   json += ",\"lowLt\":";
   json += String(NUTRIENT_LOW_PPM, 1);
@@ -5220,8 +5681,8 @@ bool sendEmailAlert(const String &subject, const String &body)
 
 void maybeSendTankLowEmail()
 {
-  String subject = "Vertical Farm Alert: Tank Low";
-  String body = "Tank level is LOW. Water valve actions are blocked until tank level recovers.\n";
+  String subject = "Vertical Farm Alert: Clean Water Tank Low";
+  String body = "Clean water tank level is LOW. Water pump actions are blocked until tank level recovers.\n";
   body += String("Cycle: ") + String(cycleCount) + "\n";
   body += String("Device IP: ") + WiFi.localIP().toString() + "\n";
   sendEmailAlert(subject, body);
@@ -5311,18 +5772,24 @@ void executeControlCycle()
   cycleCount++;
   uint32_t cycleStart = millis();
   bool wasCriticalLockout = lastCycleCriticalNutrientLockout;
+  bool previousTankLow = latestTankLow;
 
-  uint32_t requestedWaterMs = 0;
-  uint32_t requestedNutrientMs = 0;
-  uint32_t maxWaterMs = 0;
-  uint32_t maxNutrientMs = 0;
-  uint32_t sumWaterMs = 0;
-  uint32_t sumNutrientMs = 0;
-  uint8_t waterDemandCount = 0;
+  uint32_t requestedWaterMs[NUM_ZONES] = {0, 0};
+  uint32_t requestedNutrientMs[NUM_ZONES] = {0, 0};
   uint8_t nutrientDemandCount = 0;
   uint8_t nutrientBlockedZones = 0;
   uint8_t criticalNutrientZones = 0;
-  bool criticalNutrientImbalance = false;
+  bool nutrientHighLockout = false;
+
+  lastWaterPulseMs = 0;
+  lastNutrientPulseMs = 0;
+  for (uint8_t zone = 0; zone < NUM_ZONES; zone++)
+  {
+    lastZoneWaterPulseMs[zone] = 0;
+    lastZoneNutrientPulseMs[zone] = 0;
+    lastZoneNutrientBlockedByDrySoil[zone] = false;
+    lastZoneNutrientHighLockout[zone] = false;
+  }
 
   if (!haveCompleteTelemetry() || (uint32_t)(millis() - lastTelemetrySampleAtMs) >= TELEMETRY_REFRESH_INTERVAL_MS)
   {
@@ -5340,8 +5807,6 @@ void executeControlCycle()
   {
     closeAllValves();
     setAlertMessage("Sensor bridge telemetry unavailable. Automation paused.");
-    lastWaterPulseMs = 0;
-    lastNutrientPulseMs = 0;
     lastCycleElapsedMs = millis() - cycleStart;
     lastCycleCompletedAtMs = millis();
     return;
@@ -5358,6 +5823,7 @@ void executeControlCycle()
     bool kLow = false;
     bool nutrientBlockedByDrySoil = false;
     float nutrientPpm = nutrientPpmFromNPK(readings.npk);
+    bool nutrientSeverelyLow = isNutrientSeverelyLow(nutrientPpm);
     bool nutrientCritical = isNutrientCritical(nutrientPpm);
     bool nutrientSlightlyHigh = isNutrientSlightlyHighBand(nutrientPpm);
 
@@ -5366,27 +5832,22 @@ void executeControlCycle()
 
     if (nutrientCritical)
     {
-      criticalNutrientImbalance = true;
+      nutrientHighLockout = true;
       criticalNutrientZones++;
       nutrientMs = 0;
     }
 
-    if (waterMs > maxWaterMs)
+    if (waterMs > 0 && readings.moisturePct >= SOIL_MOISTURE_CRITICAL_DRY_PCT)
     {
-      maxWaterMs = waterMs;
+      waterMs = applyPulseProfile(waterMs, MAX_WATER_PULSE_MS, waterPulseProfileIndex);
     }
-    if (nutrientMs > maxNutrientMs)
+    if (nutrientMs > 0 && !nutrientSeverelyLow)
     {
-      maxNutrientMs = nutrientMs;
+      nutrientMs = applyPulseProfile(nutrientMs, MAX_NUTRIENT_PULSE_MS, nutrientPulseProfileIndex);
     }
-    if (waterMs > 0)
-    {
-      sumWaterMs += waterMs;
-      waterDemandCount++;
-    }
+
     if (nutrientMs > 0)
     {
-      sumNutrientMs += nutrientMs;
       nutrientDemandCount++;
     }
     if (nutrientBlockedByDrySoil)
@@ -5394,8 +5855,13 @@ void executeControlCycle()
       nutrientBlockedZones++;
     }
 
+    requestedWaterMs[zone] = waterMs;
+    requestedNutrientMs[zone] = nutrientMs;
+    lastZoneNutrientBlockedByDrySoil[zone] = nutrientBlockedByDrySoil;
+    lastZoneNutrientHighLockout[zone] = nutrientCritical;
+
     Serial.printf(
-        "{\"type\":\"decision\",\"zone\":%u,\"waterMs\":%lu,\"nutrientMs\":%lu,\"moistureLow\":%s,\"tempLow\":%s,\"nLow\":%s,\"pLow\":%s,\"kLow\":%s,\"nutrientBlockedByDrySoil\":%s,\"nutrientPpm\":%.2f,\"nutrientSlightlyHigh\":%s,\"nutrientCritical\":%s}\n",
+        "{\"type\":\"decision\",\"zone\":%u,\"waterMs\":%lu,\"nutrientMs\":%lu,\"moistureLow\":%s,\"tempLow\":%s,\"nLow\":%s,\"pLow\":%s,\"kLow\":%s,\"nutrientBlockedByDrySoil\":%s,\"nutrientPpm\":%.2f,\"nutrientSeverelyLow\":%s,\"nutrientSlightlyHigh\":%s,\"nutrientHighLockout\":%s}\n",
         zone + 1,
         (unsigned long)waterMs,
         (unsigned long)nutrientMs,
@@ -5406,24 +5872,20 @@ void executeControlCycle()
         kLow ? "true" : "false",
         nutrientBlockedByDrySoil ? "true" : "false",
         nutrientPpm,
+        nutrientSeverelyLow ? "true" : "false",
         nutrientSlightlyHigh ? "true" : "false",
         nutrientCritical ? "true" : "false");
   }
 
-  requestedWaterMs = blendDemandDuration(maxWaterMs, sumWaterMs, waterDemandCount);
-  requestedNutrientMs = blendDemandDuration(maxNutrientMs, sumNutrientMs, nutrientDemandCount);
-
-  lastCycleCriticalNutrientLockout = criticalNutrientImbalance;
-  if (criticalNutrientImbalance)
+  lastCycleCriticalNutrientLockout = nutrientHighLockout;
+  if (nutrientHighLockout)
   {
-    requestedWaterMs = 0;
-    requestedNutrientMs = 0;
     Serial.printf(
-        "{\"type\":\"safety\",\"event\":\"critical_nutrient_lockout\",\"zones\":%u}\n",
+        "{\"type\":\"safety\",\"event\":\"nutrient_high_zone_lockout\",\"zones\":%u}\n",
         criticalNutrientZones);
     if (!wasCriticalLockout)
     {
-      setAlertMessage("Critical nutrient imbalance. Automation paused.");
+      setAlertMessage("Nutrient too high in one or more zones. Dosing paused only for affected zones.");
     }
   }
   else if (wasCriticalLockout)
@@ -5438,7 +5900,6 @@ void executeControlCycle()
         nutrientBlockedZones);
   }
 
-  bool previousTankLow = latestTankLow;
   bool tankLow = latestTankLow;
 
   if (isnan(latestTankDistanceCm))
@@ -5454,33 +5915,31 @@ void executeControlCycle()
 
   if (tankLow && !previousTankLow)
   {
-    setAlertMessage("Water tank level is low. Refill required.");
+    setAlertMessage("Clean water tank level is low. Refill required.");
     maybeSendTankLowEmail();
   }
 
-  if (tankLow && requestedWaterMs > 0)
+  bool waterRequested = false;
+  for (uint8_t zone = 0; zone < NUM_ZONES; zone++)
+  {
+    waterRequested = waterRequested || requestedWaterMs[zone] > 0;
+  }
+
+  if (tankLow && waterRequested)
   {
     Serial.println("{\"type\":\"safety\",\"event\":\"water_blocked\",\"reason\":\"tank_low\"}");
-    setAlertMessage(String("Watering blocked: tank level is ") + tankLevelText(latestTankDistanceCm) + ". Refill tank.");
-    requestedWaterMs = 0;
+    setAlertMessage(String("Watering blocked: clean water tank level is ") + tankLevelText(latestTankDistanceCm) + ". Refill tank.");
+    for (uint8_t zone = 0; zone < NUM_ZONES; zone++)
+    {
+      requestedWaterMs[zone] = 0;
+    }
   }
+
+  runZonePumpDurations(requestedWaterMs, false, "water", cycleStart);
 
   uint32_t elapsed = millis() - cycleStart;
   uint32_t remaining = (elapsed < ACTIVE_DURATION_MS) ? (ACTIVE_DURATION_MS - elapsed) : 0;
-
-  if (requestedWaterMs > remaining)
-  {
-    requestedWaterMs = remaining;
-  }
-  if (requestedWaterMs > 0)
-  {
-    runValveFor(WATER_VALVE_PIN, requestedWaterMs, "water");
-  }
-
-  elapsed = millis() - cycleStart;
-  remaining = (elapsed < ACTIVE_DURATION_MS) ? (ACTIVE_DURATION_MS - elapsed) : 0;
-
-  if (requestedNutrientMs > 0 && remaining > 0)
+  if (nutrientDemandCount > 0 && remaining > 0)
   {
     uint32_t delayMs = BETWEEN_VALVE_DELAY_MS;
     if (delayMs > remaining)
@@ -5493,24 +5952,22 @@ void executeControlCycle()
       delayWithService(delayMs);
     }
 
-    elapsed = millis() - cycleStart;
-    remaining = (elapsed < ACTIVE_DURATION_MS) ? (ACTIVE_DURATION_MS - elapsed) : 0;
-
-    if (requestedNutrientMs > remaining)
-    {
-      requestedNutrientMs = remaining;
-    }
-
-    if (requestedNutrientMs > 0)
-    {
-      runValveFor(NUTRIENT_VALVE_PIN, requestedNutrientMs, "nutrient");
-    }
+    runZonePumpDurations(requestedNutrientMs, true, "nutrient", cycleStart);
   }
 
   closeAllValves();
 
-  lastWaterPulseMs = requestedWaterMs;
-  lastNutrientPulseMs = requestedNutrientMs;
+  for (uint8_t zone = 0; zone < NUM_ZONES; zone++)
+  {
+    if (lastZoneWaterPulseMs[zone] > lastWaterPulseMs)
+    {
+      lastWaterPulseMs = lastZoneWaterPulseMs[zone];
+    }
+    if (lastZoneNutrientPulseMs[zone] > lastNutrientPulseMs)
+    {
+      lastNutrientPulseMs = lastZoneNutrientPulseMs[zone];
+    }
+  }
   lastCycleElapsedMs = millis() - cycleStart;
   lastCycleCompletedAtMs = millis();
 }
@@ -5592,6 +6049,7 @@ void setup()
   writeLCDLines("Booting...", "ESP32-C3", "Please wait", "");
 
   loadWiFiCredentials();
+  loadControllerSettings();
   Serial.printf("[boot] Wi-Fi config present=%s ssid='%s'\n",
                 hasWiFiConfig() ? "yes" : "no",
                 configuredWiFiSsid);
